@@ -72,7 +72,7 @@ If Node isn't installed, is older than 22, or the feed disconnects, hoarding fal
 | --- | --- | --- |
 | 0 | 1/6 | 2/6 |
 | 6 | 0/6 | 4/6 |
-| 10 | 3/6 | not measured yet |
+| 10 | 3/6 | 6/6 |
 
 "Before" projected HP with the average rate, which big hits inflate, so the bot fired while the boss was still out of reach. Big hits are rare jumps, and one usually doesn't land in the ~0.5s a burst is in flight. So the bot now projects with the **steady** rate: the live feed leaves out hits over 200 damage (`OMHP_BIG_HIT`), and polling takes the median of the last 5 samples.
 

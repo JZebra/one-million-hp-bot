@@ -509,7 +509,7 @@ hoard_step() {
       local key="$left/$crits/$banked" t
       t=$(date +%s)
       if [[ $key != "$LAST_HOARD_KEY" ]] || (( t - LAST_HOARD_LOG >= 5 )); then
-        log "HOARD[$mode]: boss $hp HP (-$rate/s, lag ${lag}s), holding $left attack(s) + $crits crit charge(s) + $banked banked box(es) (~$bankest charges), can hit ~${plan#wait } (hit $HIT_MEAN±$HIT_SD, crit $CRIT_MEAN±$CRIT_SD)"
+        log "HOARD[$mode]: boss $hp HP (-$rate/s, lag ${lag}s), holding $left attack(s) + $crits crit charge(s) + $banked banked box(es) (~$bankest charges), can hit ~${plan#wait } (hit ${HIT_MEAN}+/-${HIT_SD}, crit ${CRIT_MEAN}+/-${CRIT_SD})"
         LAST_HOARD_KEY=$key LAST_HOARD_LOG=$t
       fi
       nap "$poll"

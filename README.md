@@ -6,10 +6,10 @@ A small bash bot that plays [ONE MILLION HP](https://onemillionhp.com) for you.
 
 Every API response includes your updated player state (`me`), and the bot picks its next move from it:
 
-1. **Ultimate available** → use it.
+1. **Ultimate available** → use it (unless hoarding, see below).
 2. **Loot box in the bag** → open it.
 3. **Enough shards for a Cursed Casket** (100 by default) → buy one. The next pass opens it through step 2.
-4. **Attacks left** → attack.
+4. **Attacks left** → attack. If the boss is at 1% HP or less, hoard instead (see [Last-hit hoarding](#last-hit-hoarding)).
 5. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
 6. **Boss not alive** → check again every 30s until the next boss spawns.
 
@@ -20,6 +20,54 @@ Attacks recharge one every 5s, up to 20 stored.
 Normally you get one ultimate per boss, but the admin can grant more, and so can some attack effects (the `refund` proc, "ULT RECHARGED!"). Attacks can also go above the 20 cap through bonus attacks from the admin or from procs (for example the `saved` proc, "FREE ATTACK!").
 
 The bot doesn't track any of these counts itself. It reads `ultimate_available` and `attacks_left` from the latest server state on every loop, so a regenerated ultimate or bonus attack gets used on the next pass. Grants that arrive while the bot is sleeping are seen at the next refresh, which is at most one recharge interval later.
+
+### Last-hit hoarding
+
+When the boss drops to 1% of its HP or less (`OMHP_HOARD_PCT`), the bot stops spending attacks and the ultimate. It saves them for one burst aimed at the killing blow. It keeps opening and buying boxes while it waits, because boxes can give more attacks.
+
+While hoarding, the bot works out when to fire from four numbers:
+
+- **Boss HP**, from the live feed (below), or from `/api/state` if the feed isn't available.
+- **Other players' damage rate** (HP per second), not counting our own hits.
+- **Our damage per hit**, using a cautious estimate: the 25th percentile of this session's non-crit hits. The ultimate counts as the smallest ultimate seen this session. Before any ultimate this session, it counts as 0.
+- **How long until a burst lands:** how far behind the live feed is (`lag`), plus how long our requests take to reach the server (`OMHP_FIRE_LEAD`, 0.3s).
+
+From these it predicts the boss's HP at the moment a burst would arrive, and then:
+
+| Situation | Action |
+| --- | --- |
+| That HP is within what we hold | **Fire** enough attacks to kill the HP we currently see, plus `OMHP_BURST_EXTRA` (2), and the ultimate, all in parallel. Attacks that arrive after the kill are rejected. |
+| It will be within reach before the next check | **Time the shot:** sleep exactly until then, then fire everything. |
+| We're at the attack cap | **Spend one attack** so recharge isn't wasted. This also pushes the boss toward kill range if nobody else is attacking. |
+| Otherwise | Keep watching. |
+
+After each boss dies, the bot logs who got the killing blow. The session summary counts your last hits.
+
+#### Live feed (WebSocket)
+
+The game streams every attack over a WebSocket at `/api/live`. With Node 22+ installed, the bot starts `omhp-live.mjs` next to itself. The helper follows that stream and writes the latest boss state to a small file, which the bot reads every 0.2s while hoarding. That gives:
+
+- **HP every 0.2s,** without an HTTP request per check.
+- **An accurate damage rate for other players,** because each event names the attacker, so our own hits can be left out.
+- **The feed's lag,** from each event's server timestamp. The live site ran 0.15–0.3s behind.
+
+If Node isn't installed, is older than 22, or the feed disconnects, hoarding falls back to polling `/api/state` every `OMHP_HOARD_POLL` seconds (1s). Set `OMHP_LIVE=0` to always poll.
+
+#### How well it works
+
+I tested this against a local simulator of the game, not the real server. The simulated server adds 50–200ms of request latency and a 0.3s feed lag. The simulator's ultimate was turned off so the attacks alone had to land the kill. Last hits out of 6 bosses:
+
+| Other players' damage | Live feed | Polling |
+| --- | --- | --- |
+| 300 HP/s | 6/6 | 6/6 |
+| 1000 HP/s | 6/6 | 6/6 |
+| 3000 HP/s | 3/6 | 3/6 |
+
+When I sampled the real boss, other players dealt about 30–560 HP/s. At 3000 HP/s, by the time a burst arrives, someone else often has already killed the boss.
+
+This test favors polling, because the simulated `/api/state` has no lag. The feed's advantages are its damage rate and checking HP 5 times a second without calling the API.
+
+On the real server the results also depend on network latency to the server, on how concurrent attacks from one player are processed, and on whether rejected attacks really cost nothing. Those are assumptions until you've watched a real kill.
 
 ### Buying Cursed Caskets
 
@@ -39,6 +87,7 @@ Duration        1h 2m 5s
 Attacks         6   (normal 3, crit 2, ultimate 1)
 Total damage    11,253
 Avg damage      normal 44   crit 1350   ultimate 8421
+Last hits       1 of 1 boss kill(s) seen
 Loot boxes      10 opened  (1 bought for 100 shards)
   CURSED CASKET x4
       LEGENDARY x1: GOLDEN SWORD
@@ -69,6 +118,7 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 
 - `bash`, `curl`, `uuidgen` (all included with macOS)
 - `jq`: `brew install jq`
+- Optional: Node 22+ for the live feed (`brew install node`). Without it, hoarding polls the API instead.
 
 ## Usage
 
@@ -93,6 +143,13 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
 | `OMHP_BUY_BOX`    | `cursed_casket`             | Box to buy with shards; empty disables buying |
 | `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |
+| `OMHP_HOARD_PCT`  | `1`                         | Start hoarding at this % of boss HP; `0` disables hoarding |
+| `OMHP_BURST_EXTRA`| `2`                         | Extra attacks on top of the estimated kill count |
+| `OMHP_FIRE_LEAD`  | `0.3`                       | Seconds for our attacks to reach the server |
+| `OMHP_HIT_EST`    | `1`                         | Per-hit damage guess before this session has any hits |
+| `OMHP_LIVE`       | `1`                         | Use the WebSocket feed when Node 22+ is available |
+| `OMHP_LIVE_POLL`  | `0.2`                       | Seconds between live-feed reads while hoarding |
+| `OMHP_HOARD_POLL` | `1`                         | Seconds between `/api/state` polls while hoarding without the feed |
 
 ## Example output (illustrative)
 
@@ -117,6 +174,7 @@ These are the endpoints the game's own web client uses, found by reading `js/api
 | -------------------------- | -------------------------------------- |
 | `GET  /api/me`             | (none)                                 |
 | `GET  /api/state`          | (none; public; includes `server_time` and `boss`) |
+| `WS   /api/live`           | Push stream: `snapshot`, then an `update` per attack with `boss` and `events` (`t`, `player_id`, `damage`); also `gift` and `shards`. Send `{"type":"auth","token":...}` to be told about gifts. |
 | `POST /api/attack`         | `{ "kind": "normal" \| "ultimate", "request_id": uuid }` |
 | `POST /api/boxes/open`     | `{ "box_id": string, "request_id": uuid }` |
 | `POST /api/shop/buy`       | `{ "box_id": string }`                 |

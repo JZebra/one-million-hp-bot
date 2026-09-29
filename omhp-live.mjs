@@ -51,8 +51,8 @@ let boss = null;
 let lag = null;
 let gifts = 0;
 let connected = false;
-let recv = 0;
-let since = 0; // server time we started counting hits (connect or new boss) // when the last real message arrived (the stream is stale if this is old)
+let recv = 0; // when the last real message arrived (the stream is stale if this is old)
+let since = 0; // server time we started counting hits (connect or new boss)
 /** @type {{t: number, damage: number}[]} */
 let hits = [];
 

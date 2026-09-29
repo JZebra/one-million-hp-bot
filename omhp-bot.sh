@@ -47,6 +47,7 @@ BANK_BOXES="${OMHP_BANK_BOXES-wooden_crate,iron_chest}" # boxes kept unopened un
 BANK_MAX="${OMHP_BANK_MAX:-60}"       # open banked boxes beyond this many
 HOARD_POLL="${OMHP_HOARD_POLL:-1}"    # seconds between boss HP checks while hoarding
 HIT_EST_DEFAULT="${OMHP_HIT_EST:-20}" # per-hit damage guess until the logs have data
+MARGIN_SD="${OMHP_MARGIN_SD:-1.5}"    # fire when HP <= burst mean - this many sd (1.5 = ~93% sure)
 LIVE="${OMHP_LIVE:-1}"                # 1 = use the WebSocket feed when Node 22+ is available
 LIVE_POLL="${OMHP_LIVE_POLL:-0.2}"    # seconds between live-feed reads while hoarding
 FIRE_LEAD="${OMHP_FIRE_LEAD:-0.3}"    # seconds for our attacks to reach the server
@@ -271,9 +272,8 @@ hoarding() {
 }
 
 # Damage estimates from recent attacks across all session logs, refreshed at
-# most once a minute: mean and spread of non-crit normal hits, and the 25th
-# percentile of crits (what a banked crit charge is counted as).
-HIT_MEAN=$HIT_EST_DEFAULT HIT_SD=0 CRIT_P25=$((HIT_EST_DEFAULT * 8)) EST_AT=0
+# most once a minute: mean and spread of non-crit normal hits and of crits.
+HIT_MEAN=$HIT_EST_DEFAULT HIT_SD=0 CRIT_MEAN=$((HIT_EST_DEFAULT * 12)) CRIT_SD=0 EST_AT=0
 
 update_estimates() {
   local now; now=$(date +%s)
@@ -284,12 +284,14 @@ update_estimates() {
     --argjson d "$HIT_EST_DEFAULT" '
     [.[] | select(.t == "attack" and .kind == "normal")] as $a
     | ($a | map(select(.crit | not) | .damage) | .[-3000:]) as $h
-    | ($a | map(select(.crit) | .damage) | .[-300:] | sort) as $c
-    | (if ($h | length) > 20 then ($h | add / length) else $d end) as $m
-    | (if ($h | length) > 20 then ($h | map(. * .) | add / length - $m * $m | if . < 0 then 0 else sqrt end) else 0 end) as $sd
-    | (if ($c | length) > 10 then $c[($c | length) / 4 | floor] else $m * 8 end) as $cp
-    | "\($m * 10 | round / 10) \($sd * 10 | round / 10) \($cp)"' 2>/dev/null)
-  [[ -n $est ]] && read -r HIT_MEAN HIT_SD CRIT_P25 <<<"$est"
+    | ($a | map(select(.crit) | .damage) | .[-300:]) as $c
+    | def sd($x; $m): $x | map(. * .) | add / length - $m * $m | if . < 0 then 0 else sqrt end;
+    (if ($h | length) > 20 then ($h | add / length) else $d end) as $m
+    | (if ($h | length) > 20 then sd($h; $m) else 0 end) as $sd
+    | (if ($c | length) > 10 then ($c | add / length) else $m * 12 end) as $cm
+    | (if ($c | length) > 10 then sd($c; $cm) else 0 end) as $csd
+    | "\($m * 10 | round / 10) \($sd * 10 | round / 10) \($cm | round) \($csd | round)"' 2>/dev/null)
+  [[ -n $est ]] && read -r HIT_MEAN HIT_SD CRIT_MEAN CRIT_SD <<<"$est"
 }
 
 # box_to_open: the next box to open, if any. Banked types stay shut (they're
@@ -305,9 +307,9 @@ box_to_open() {
       // (if $all or $held > $max then $banked[0].box_id else empty end)' <<<"$ME"
 }
 
-# bank_estimate: "COUNT CHARGES ATTACKS" = banked boxes, the crit charges
-# opening them all will cautiously yield (mean - 1.5 sd, from the game's box
-# odds), and the attacks they're expected to add.
+# bank_estimate: "COUNT CHARGES VAR ATTACKS" = banked boxes, the crit charges
+# opening them all is expected to yield (from the game's box odds) and its
+# variance, and the attacks they're expected to add.
 bank_estimate() {
   jq -r --arg bank "$BANK_BOXES" --argjson ct "$CONTENT" '($bank | split(",")) as $bk
     | [(.boxes // [])[] | select(.box_id as $i | $bk | index($i))] as $b
@@ -319,7 +321,7 @@ bank_estimate() {
     | ($x | map(.n * .mean) | add // 0) as $m
     | ($x | map(.n * .var) | add // 0) as $v
     | ($b | map((($ct.box_atk // {})[.box_id] // $fba[.box_id] // 0) * (.count // 1)) | add // 0) as $atk
-    | "\($n) \([$m - 1.5 * ($v | sqrt), 0] | max | floor) \($atk | floor)"' <<<"$ME"
+    | "\($n) \($m * 100 | round / 100) \($v * 100 | round / 100) \($atk | floor)"' <<<"$ME"
 }
 
 # How many boxes are banked (for the status line).
@@ -443,7 +445,7 @@ refresh_me_if_due() {
 }
 
 hoard_step() {
-  local hp left per crits plan rate lag poll mode banked bankest bankatk
+  local hp left per crits plan rate lag poll mode banked bankest bankvar bankatk
   if live_read; then
     mode=live rate=$LIVE_RATE lag=$LIVE_LAG poll=$LIVE_POLL
     hoarding || return 0 # the feed says the boss died or left range
@@ -456,14 +458,17 @@ hoard_step() {
   left=$(jq -r '.attacks_left // 0' <<<"$ME")
   per=$(jq -r '.attacks_per_day // 20' <<<"$ME")
   crits=$(jq -r '.next_crits // 0' <<<"$ME")
-  read -r banked bankest bankatk <<<"$(bank_estimate)"
+  read -r banked bankest bankvar bankatk <<<"$(bank_estimate)"
   update_estimates
 
-  # What we can deal in one burst ($cap): crit charges (ours plus what the
-  # woven-in bank will cautiously yield) go to the attacks, counted at the crit
-  # 25th percentile; the rest are normal hits (mean minus 1.5 standard
-  # deviations of their sum). The ultimate isn't counted: it's used as soon
-  # as it's ready. Attacks the bank adds aren't counted either (bonus).
+  # What we can deal in one burst ($cap), estimated as one sum: N attacks
+  # (held plus those the bank is expected to add), of which C carry crit
+  # charges (ours plus the bank's expected yield). Mean = C crits + (N - C)
+  # normal hits; the variance adds each hit's spread and the uncertainty in
+  # how many charges the bank gives. $cap = mean - MARGIN_SD standard
+  # deviations. (Counting each crit at a low percentile instead made the
+  # bot wait for HP that other players' ultimates never left us.) The
+  # ultimate isn't counted: it's used as soon as it's ready.
   # The HP we see is `lag` seconds old and our attacks take FIRE_LEAD to land;
   # others keep hitting meanwhile. $land = expected HP when the burst arrives.
   #   fire N      $land is within $cap: fire the woven burst now. N = attacks
@@ -473,13 +478,16 @@ hoard_step() {
   #               isn't wasted (with charges, keep them for the burst)
   #   wait CAP    keep watching
   plan=$(jq -nr --argjson hp "$hp" --argjson left "$left" --argjson per "$per" --argjson crits "$crits" \
-    --argjson bankest "$bankest" --argjson bankatk "$bankatk" \
-    --argjson mean "$HIT_MEAN" --argjson sd "$HIT_SD" --argjson critp "$CRIT_P25" --argjson rate "$rate" \
+    --argjson bankest "$bankest" --argjson bankvar "$bankvar" --argjson bankatk "$bankatk" \
+    --argjson mean "$HIT_MEAN" --argjson sd "$HIT_SD" --argjson cmean "$CRIT_MEAN" --argjson csd "$CRIT_SD" \
+    --argjson z "$MARGIN_SD" --argjson rate "$rate" \
     --argjson lead "$(awk -v a="$lag" -v b="$FIRE_LEAD" 'BEGIN{print a+b}')" --argjson poll "$poll" '
-    ([$crits + $bankest, $left] | min) as $c | ($left - $c) as $p
-    | ([$p * $mean - 1.5 * $sd * ($p | sqrt), 0] | max + $c * $critp | floor) as $cap
+    ($left + $bankatk) as $n
+    | ([$crits + $bankest, $n] | min) as $c
+    | ($c * $cmean + ($n - $c) * $mean) as $bm
+    | ($c * $csd * $csd + ($n - $c) * $sd * $sd + $bankvar * ($cmean - $mean) * ($cmean - $mean)) as $bv
+    | ([$bm - $z * ($bv | sqrt), 0] | max | floor) as $cap
     | ($hp - $rate * $lead) as $land
-    | ($left + $bankatk) as $n
     | if $left <= 0 then "wait \($cap)"
       elif $land <= $cap then "fire \($n)"
       elif $rate > 0 and ($land - $cap) / $rate < $poll then "timed \(($land - $cap) / $rate * 1000 | floor / 1000) \($n)"
@@ -501,7 +509,7 @@ hoard_step() {
       local key="$left/$crits/$banked" t
       t=$(date +%s)
       if [[ $key != "$LAST_HOARD_KEY" ]] || (( t - LAST_HOARD_LOG >= 5 )); then
-        log "HOARD[$mode]: boss $hp HP (-$rate/s, lag ${lag}s), holding $left attack(s) + $crits crit charge(s) + $banked banked box(es) (~$bankest charges), can hit ~${plan#wait } (hit ~$HIT_MEAN, crit ~$CRIT_P25)"
+        log "HOARD[$mode]: boss $hp HP (-$rate/s, lag ${lag}s), holding $left attack(s) + $crits crit charge(s) + $banked banked box(es) (~$bankest charges), can hit ~${plan#wait } (hit $HIT_MEAN±$HIT_SD, crit $CRIT_MEAN±$CRIT_SD)"
         LAST_HOARD_KEY=$key LAST_HOARD_LOG=$t
       fi
       nap "$poll"

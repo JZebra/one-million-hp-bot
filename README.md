@@ -7,7 +7,7 @@ A small bash bot that plays [ONE MILLION HP](https://onemillionhp.com) for you.
 Every API response includes your updated player state (`me`), and the bot picks its next move from it:
 
 1. **Ultimate available** → use it, always. It does damage right away, and your charm's refunds recharge it.
-2. **Loot box in the bag** → open it. Wooden crates and iron chests are the exception: they're banked unopened until hoarding starts (see below).
+2. **Loot box in the bag** → open it. Wooden crates and iron chests are the exception: they're banked unopened until the kill attempt itself (see below).
 3. **Enough shards for a Cursed Casket** (100 by default) → buy one. The next pass opens it through step 2.
 4. **Attacks left** → attack. If the boss is at 5% HP or less, hoard instead (see [Last-hit hoarding](#last-hit-hoarding)).
 5. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
@@ -25,22 +25,23 @@ The bot doesn't track any of these counts itself. It reads `ultimate_available` 
 
 Other players save their ultimates (900–1900 damage each) and use them at the end. The last real bosses went from 1500–3000 HP to dead in a single ultimate. A burst of 20 normal hits (~430 damage) is too small to compete. Crit charges from loot boxes ("next 3 attacks will crit", ~200–700 damage each) are what make the killing blow reachable. The strategy has three parts:
 
-1. **Bank boxes for crit charges.** Wooden crates and iron chests (`OMHP_BANK_BOXES`) stay unopened for the whole boss, up to `OMHP_BANK_MAX` (60). Beyond that, the extras are opened as usual. Cursed caskets and other boxes still open right away. Banking both types yields about 9 crit charges per hour.
-2. **Hoard from 5% boss HP** (`OMHP_HOARD_PCT`). Normal attacks are only spent at the attack cap, so the bank is full when the endgame rush starts. That costs nothing, because recharge keeps flowing. The banked boxes are opened at this point, turning them into crit charges. While charges are banked, the bot doesn't spend attacks even at the cap, because each attack would burn a charge. The ultimate is still used as soon as it's ready.
-3. **Fire everything at the right moment.** The bot predicts the boss's HP when a burst would land. As soon as that's within reach, it fires every held attack at once. Charges apply to the first attacks the server processes.
+1. **Bank boxes for crit charges.** Wooden crates and iron chests (`OMHP_BANK_BOXES`) stay unopened, up to `OMHP_BANK_MAX` (60). Beyond that, the extras are opened as usual. Cursed caskets and other boxes still open right away. Banking both types yields about 9 crit charges per hour.
+2. **Hoard from 5% boss HP** (`OMHP_HOARD_PCT`). Normal attacks are only spent at the attack cap, so the bank is full when the endgame rush starts. That costs nothing, because recharge keeps flowing. If a charge does exist (from a cursed casket, say), the bot stops spending even at the cap, because the game would spend the charge on the next attack. The ultimate is still used as soon as it's ready.
+3. **Open the bank as late as possible, then fire.** The game spends crit charges on your very next attacks, so the banked boxes stay shut until the kill attempt itself. The bot predicts the boss's HP when a burst would land. Once that's within reach of a burst with the charges the bank will likely produce, it opens every banked box at once, 20 at a time. Then it re-reads its real charge count and fires every held attack right away if the boss is still in reach. Charges apply to the first attacks the server processes. If someone else kills the boss first, the boxes stay banked for the next boss.
 
 While hoarding, the bot works out when to fire from these numbers:
 
 - **Boss HP**, from the live feed (below), or from `/api/state` if the feed isn't available.
 - **Other players' steady damage rate** (HP per second), not counting our own hits or big hits (crits and ultimates over 200 damage).
-- **What one burst can deal:** charged attacks count as the 25th percentile of your crits. The remaining attacks count as mean − 1.5 standard deviations of their total. Both figures come from your recent history across all session logs, refreshed once a minute.
-- **How long until a burst lands:** how far behind the live feed is (`lag`), plus how long our requests take to reach the server (`OMHP_FIRE_LEAD`, 0.3s).
+- **What one burst can deal:** charged attacks count as the 25th percentile of your crits. The bank counts as the charges it will cautiously produce (mean − 1.5 sd, from the game's box odds in `/api/content`), about 7 for 40 crates and 15 chests. The remaining attacks count as mean − 1.5 standard deviations of their total. Both figures come from your recent history across all session logs, refreshed once a minute.
+- **How long until a burst lands:** how far behind the live feed is (`lag`), plus how long our requests take to reach the server (`OMHP_FIRE_LEAD`, 0.3s), plus the time to open the bank first (`OMHP_OPEN_LEAD`, 0.8s; opening 55 boxes took 0.67–0.80s in the simulator).
 
 | Situation | Action |
 | --- | --- |
-| The predicted HP is within what one burst can deal | **Fire** every held attack in parallel. Attacks that arrive after the kill are rejected. |
-| It will be within reach before the next check | **Time the shot:** sleep exactly until then, then fire. |
-| We're at the attack cap and no charges are banked | **Spend one attack** so recharge isn't wasted. |
+| The predicted HP is within what one burst can deal with the charges we have now (with a bank waiting, within 80% of it) | **Fire** every held attack in parallel; the bank stays shut. Attacks that arrive after the kill are rejected. |
+| It's within reach once the bank is opened | **Open the bank**, then re-plan with the real charges, which fires at once if they reach. |
+| Either becomes true before the next check | **Time it:** sleep exactly until then, then open or fire. |
+| We're at the attack cap with no crit charges | **Spend one attack** so recharge isn't wasted. |
 | Otherwise | Keep watching. |
 
 After each boss dies, the bot logs who got the killing blow, and the session summary counts your last hits. Every attack record also stores the boss's HP at that moment, for tuning.
@@ -73,6 +74,8 @@ If Node isn't installed, is older than 22, or the feed disconnects, hoarding fal
 | 0 | 1/6 | 2/6 |
 | 6 | 0/6 | 4/6 |
 | 10 | 3/6 | 6/6 |
+
+**Opening the bank late** (same simulated endgame, 40 crates and 15 chests banked, 0 charges to start): **4/6** last hits. Each winning trial opened the bank in 0.7–0.8s, got 10–16 real charges, and fired immediately. Both losses opened and fired correctly, but another player's hit landed first. For comparison, 6/6 in the table above assumes the charges were already there, which the game doesn't allow without spending them.
 
 "Before" projected HP with the average rate, which big hits inflate, so the bot fired while the boss was still out of reach. Big hits are rare jumps, and one usually doesn't land in the ~0.5s a burst is in flight. So the bot now projects with the **steady** rate: the live feed leaves out hits over 200 damage (`OMHP_BIG_HIT`), and polling takes the median of the last 5 samples.
 
@@ -152,9 +155,11 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
 | `OMHP_BUY_BOX`    | `cursed_casket`             | Box to buy with shards; empty disables buying |
 | `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |
-| `OMHP_HOARD_PCT`  | `5`                         | Start hoarding (and open banked boxes) at this % of boss HP; `0` disables hoarding |
+| `OMHP_HOARD_PCT`  | `5`                         | Start hoarding at this % of boss HP; `0` disables hoarding |
 | `OMHP_BANK_BOXES` | `wooden_crate,iron_chest`   | Box types kept unopened until hoarding; empty disables banking |
 | `OMHP_BANK_MAX`   | `60`                        | Open banked boxes beyond this many |
+| `OMHP_OPEN_LEAD`  | `0.8`                       | Seconds allowed for opening the bank right before a burst |
+| `OMHP_BIG_HIT`    | `200`                       | Other players' hits above this are left out of the steady damage rate |
 | `OMHP_FIRE_LEAD`  | `0.3`                       | Seconds for our attacks to reach the server |
 | `OMHP_HIT_EST`    | `20`                        | Per-hit damage guess before the logs have any hits |
 | `OMHP_LIVE`       | `1`                         | Use the WebSocket feed when Node 22+ is available |

@@ -19,9 +19,11 @@
 # the kill attempt itself: the game spends crit charges on the very next
 # attacks, so charges must not exist before the burst. The bot watches the
 # boss HP; when a burst (with the charges the bank will likely produce) can
-# finish the boss, it opens the whole bank at once, then fires every attack
-# to try to land the killing blow. At the attack cap it spends one at a time
-# so recharge isn't wasted, unless that would burn a crit charge.
+# finish the boss, it fires one burst that weaves box opens with attacks
+# (open, attack, open, attack...), so each charge is created just before the
+# attacks that use it. Opens and attacks are separate endpoints with their
+# own rate limits, so weaving costs no extra time. At the attack cap it spends
+# one at a time so recharge isn't wasted, unless that would burn a crit charge.
 #
 # Every action is appended to logs/session-*.jsonl; stopping the bot (Ctrl-C,
 # SIGTERM) prints a summary built from that file.
@@ -48,7 +50,6 @@ HIT_EST_DEFAULT="${OMHP_HIT_EST:-20}" # per-hit damage guess until the logs have
 LIVE="${OMHP_LIVE:-1}"                # 1 = use the WebSocket feed when Node 22+ is available
 LIVE_POLL="${OMHP_LIVE_POLL:-0.2}"    # seconds between live-feed reads while hoarding
 FIRE_LEAD="${OMHP_FIRE_LEAD:-0.3}"    # seconds for our attacks to reach the server
-OPEN_LEAD="${OMHP_OPEN_LEAD:-0.8}"    # extra seconds to open the banked boxes before a burst
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="${OMHP_LOG_DIR:-$SCRIPT_DIR/logs}"
 
@@ -153,7 +154,8 @@ CONTENT=$(api GET /api/content | jq -c '{
   box_rank: ([.boxes // [] | to_entries[] | {key: .value.id, value: .key}] | from_entries),
   rarity_rank: ([.rarities[]? | {key: .id, value: .rank}] | from_entries),
   box_crit: ([.boxes[]? | {key: .id, value: ([.odds[]? | select(.kind == "next_crit")]
-    | {mean: (map(.chance * (.amount // 1)) | add // 0), m2: (map(.chance * (.amount // 1) * (.amount // 1)) | add // 0)})}] | from_entries)
+    | {mean: (map(.chance * (.amount // 1)) | add // 0), m2: (map(.chance * (.amount // 1) * (.amount // 1)) | add // 0)})}] | from_entries),
+  box_atk: ([.boxes[]? | {key: .id, value: ([.odds[]? | select(.kind == "attacks") | .chance * (.amount // 1)] | add // 0)}] | from_entries)
 }' 2>/dev/null) || CONTENT='{}'
 [[ -n $CONTENT ]] || CONTENT='{}'
 
@@ -291,7 +293,7 @@ update_estimates() {
 }
 
 # box_to_open: the next box to open, if any. Banked types stay shut (they're
-# opened by open_bank right before a burst) unless the bank passes BANK_MAX;
+# woven into the kill burst) unless the bank passes BANK_MAX;
 # everything else opens right away.
 box_to_open() {
   jq -er --arg bank "$BANK_BOXES" --argjson all false --argjson max "$BANK_MAX" '
@@ -303,51 +305,21 @@ box_to_open() {
       // (if $all or $held > $max then $banked[0].box_id else empty end)' <<<"$ME"
 }
 
-# bank_estimate: "COUNT CHARGES" = banked boxes, and the crit charges opening
-# them all will cautiously yield (mean - 1.5 sd, from the game's box odds).
+# bank_estimate: "COUNT CHARGES ATTACKS" = banked boxes, the crit charges
+# opening them all will cautiously yield (mean - 1.5 sd, from the game's box
+# odds), and the attacks they're expected to add.
 bank_estimate() {
   jq -r --arg bank "$BANK_BOXES" --argjson ct "$CONTENT" '($bank | split(",")) as $bk
     | [(.boxes // [])[] | select(.box_id as $i | $bk | index($i))] as $b
     | ($b | map(.count // 1) | add // 0) as $n
     # Fallback odds (from /api/content at the time of writing) if content failed to load.
     | {wooden_crate: {mean: 0.185, m2: 0.185}, iron_chest: {mean: 0.375, m2: 0.75}} as $fb
+    | {wooden_crate: 0.598, iron_chest: 0.7} as $fba
     | ($b | map((($ct.box_crit // {})[.box_id] // $fb[.box_id] // {mean: 0, m2: 0}) as $o | {n: (.count // 1), mean: $o.mean, var: ($o.m2 - $o.mean * $o.mean)})) as $x
     | ($x | map(.n * .mean) | add // 0) as $m
     | ($x | map(.n * .var) | add // 0) as $v
-    | "\($n) \([$m - 1.5 * ($v | sqrt), 0] | max | floor)"' <<<"$ME"
-}
-
-# open_bank: open every banked box at once, right before a burst, so the crit
-# charges go straight into it. Speed matters here (the boss may die any
-# moment), so results are handled in one jq pass instead of box by box.
-open_bank() {
-  local dir ids id i=0 pids=() crits0 t0
-  t0=$(now_f)
-  crits0=$(jq -r '.next_crits // 0' <<<"$ME")
-  ids=$(jq -r --arg bank "$BANK_BOXES" '($bank | split(",")) as $bk
-    | (.boxes // [])[] | select(.box_id as $i | $bk | index($i)) | .box_id as $id | range(.count // 1) | $id' <<<"$ME")
-  [[ -n $ids ]] || return 0
-  dir=$(mktemp -d)
-  for id in $ids; do
-    i=$((i + 1))
-    { api POST /api/boxes/open "$(open_body "$id")" >"$dir/$id.$i.json" || mv "$dir/$id.$i.json" "$dir/$id.$i.err"; } &
-    pids+=($!)
-    (( ${#pids[@]} >= 30 )) && { wait "${pids[@]}"; pids=(); }
-  done
-  (( ${#pids[@]} )) && wait "${pids[@]}"
-  # Charges and attacks only go up while boxes open, so the response with the
-  # most of both is the final state.
-  local out
-  out=$(cd "$dir" && jq -c -s '[.[] | .me | select(. != null)] | max_by([.next_crits // 0, .attacks_left // 0])' *.json 2>/dev/null)
-  [[ -n $out && $out != null ]] && ME=$out
-  local ok bad
-  ok=$(cd "$dir" && ls *.json 2>/dev/null | wc -l | tr -d ' ')
-  bad=$(cd "$dir" && ls *.err 2>/dev/null | wc -l | tr -d ' ')
-  (( ok )) && (cd "$dir" && for f in *.json; do jq -c --arg b "${f%%.*}" '{b: $b, r: .result}' "$f"; done) |
-    jq -c --argjson ct "$CONTENT" --argjson ts "$(date +%s)" '.r as $r | ($ct.items // {})[$r.item_id // ""] as $i |
-      {t: "box", box_id: .b, result: ($r + {item_name: $i.name, rarity: ($r.rarity // $i.rarity)}), ts: $ts}' >>"$SESSION_LOG"
-  rm -rf "$dir"
-  log "OPENED BANK: $ok box(es)$( (( bad )) && echo ", $bad failed") in $(awk -v a="$t0" -v b="$(now_f)" 'BEGIN{printf "%.2f", b-a}')s -> crit charges $crits0 -> $(jq -r '.next_crits // 0' <<<"$ME"), attacks $(jq -r '.attacks_left // 0' <<<"$ME")"
+    | ($b | map((($ct.box_atk // {})[.box_id] // $fba[.box_id] // 0) * (.count // 1)) | add // 0) as $atk
+    | "\($n) \([$m - 1.5 * ($v | sqrt), 0] | max | floor) \($atk | floor)"' <<<"$ME"
 }
 
 # How many boxes are banked (for the status line).
@@ -356,27 +328,54 @@ banked_count() {
     | [(.boxes // [])[] | select(.box_id as $i | $bk | index($i)) | .count // 1] | add // 0' <<<"$ME"
 }
 
-# burst N: fire N normal attacks at once
+# burst N: fire N attacks at once, woven with opening every banked box
+# (open, attack, open, attack...): each crit charge lands just before the
+# attacks that use it. Attack requests beyond what we end up having are
+# rejected with NO_ATTACKS.
 burst() {
-  local n=$1 dir i kind
-  local pids=()
+  local n=$1 dir i=0 j kind f id ids pids=() t0
+  t0=$(now_f)
+  ids=($(jq -r --arg bank "$BANK_BOXES" '($bank | split(",")) as $bk
+    | (.boxes // [])[] | select(.box_id as $i | $bk | index($i)) | .box_id as $id | range(.count // 1) | $id' <<<"$ME"))
   dir=$(mktemp -d)
-  log "BURST: $n attack(s) with $(jq -r '.next_crits // 0' <<<"$ME") crit charge(s) at $(jq -r '.hp' <<<"$BOSS") HP"
-  for ((i = 1; i <= n; i++)); do
-    { api POST /api/attack "$(attack_body normal)" >"$dir/normal.$i"; echo $? >"$dir/normal.$i.rc"; } &
-    pids+=($!)
-  done
-  (( ${#pids[@]} )) && wait "${pids[@]}"
-  local failed=()
-  for f in "$dir"/*.rc; do
-    kind=$(basename "$f"); kind=${kind%%.*}
-    if [[ $(cat "$f") == 0 ]]; then
-      on_attack "$kind" "$(cat "${f%.rc}")" quiet
-    else
-      failed+=("$(jq -r '.error.code // "?"' <"${f%.rc}")")
+  log "BURST: $n attack(s) woven with ${#ids[@]} banked box(es), $(jq -r '.next_crits // 0' <<<"$ME") crit charge(s) at $(jq -r '.hp' <<<"$BOSS") HP"
+  for ((j = 0; j < n || j < ${#ids[@]}; j++)); do
+    if (( j < ${#ids[@]} )); then
+      id=${ids[$j]}
+      { api POST /api/boxes/open "$(open_body "$id")" >"$dir/box.$id.$j" || mv "$dir/box.$id.$j" "$dir/boxerr.$id.$j"; } &
+      pids+=($!)
+    fi
+    if (( j < n )); then
+      { api POST /api/attack "$(attack_body normal)" >"$dir/atk.$j" || mv "$dir/atk.$j" "$dir/atkerr.$j"; } &
+      pids+=($!)
     fi
   done
+  (( ${#pids[@]} )) && wait "${pids[@]}"
+  local burst_s; burst_s=$(awk -v a="$t0" -v b="$(now_f)" 'BEGIN{printf "%.2f", b-a}')
+
+  # Box results in one jq pass (fast; the boss may die any moment).
+  if compgen -G "$dir/box.*" >/dev/null; then
+    (cd "$dir" && for f in box.*; do id=${f#box.}; jq -c --arg b "${id%.*}" '{b: $b, r: .result}' "$f"; done) |
+      jq -c --argjson ct "$CONTENT" --argjson ts "$(date +%s)" '.r as $r | ($ct.items // {})[$r.item_id // ""] as $i |
+        {t: "box", box_id: .b, result: ($r + {item_name: $i.name, rarity: ($r.rarity // $i.rarity)}), ts: $ts}' >>"$SESSION_LOG"
+  fi
+  local opened crits_made boxerr
+  opened=$(ls "$dir" | grep -c '^box\.')
+  boxerr=$(ls "$dir" | grep -c '^boxerr\.')
+  crits_made=$( (cd "$dir" && cat box.* 2>/dev/null) | jq -s '[.[] | .result | select(.kind == "next_crit") | .amount // 1] | add // 0')
+
+  local failed=() hits=0 crit_hits=0
+  for f in "$dir"/atk.*; do
+    [[ -e $f ]] || continue
+    on_attack normal "$(cat "$f")" quiet
+    hits=$((hits + 1))
+    [[ $(jq -r '.attack.crit // false' <"$f") == true ]] && crit_hits=$((crit_hits + 1))
+  done
+  for f in "$dir"/atkerr.*; do
+    [[ -e $f ]] && failed+=("$(jq -r '.error.code // "?"' <"$f")")
+  done
   rm -rf "$dir"
+  log "  burst took ${burst_s}s: $hits hit(s), $crit_hits crit; opened $opened box(es)$( (( boxerr )) && echo " ($boxerr failed)") making $crits_made crit charge(s)"
   (( ${#failed[@]} )) && log "  ${#failed[@]} attack(s) rejected: $(printf '%s\n' "${failed[@]}" | sort | uniq -c | awk '{printf "%s%s x%s", (NR>1?", ":""), $2, $1}')"
   refresh || nap 5
   log "  $(stats)"
@@ -444,7 +443,7 @@ refresh_me_if_due() {
 }
 
 hoard_step() {
-  local hp left per crits plan rate lag poll mode banked bankest
+  local hp left per crits plan rate lag poll mode banked bankest bankatk
   if live_read; then
     mode=live rate=$LIVE_RATE lag=$LIVE_LAG poll=$LIVE_POLL
     hoarding || return 0 # the feed says the boss died or left range
@@ -457,57 +456,43 @@ hoard_step() {
   left=$(jq -r '.attacks_left // 0' <<<"$ME")
   per=$(jq -r '.attacks_per_day // 20' <<<"$ME")
   crits=$(jq -r '.next_crits // 0' <<<"$ME")
-  read -r banked bankest <<<"$(bank_estimate)"
+  read -r banked bankest bankatk <<<"$(bank_estimate)"
   update_estimates
 
-  # What we can deal in one burst: crit charges go to the first attacks
-  # (counted at the crit 25th percentile), the rest are normal hits (mean
-  # minus 1.5 standard deviations of their sum). The ultimate isn't counted:
-  # it's used as soon as it's ready. $cap counts the charges we have now,
-  # $bcap adds what opening the banked boxes will cautiously yield.
-  # The HP we see is `lag` seconds old and our attacks take FIRE_LEAD to land
-  # (plus OPEN_LEAD when the boxes are opened first); others keep hitting
-  # meanwhile. $land / $oland = expected HP when the burst arrives.
-  #   fire N      $land is within $cap: fire everything now (boxes stay banked).
-  #               With a bank waiting, only on a clear margin (80% of $cap):
-  #               a thin plain burst that falls short wastes the attacks.
-  #   open        $oland is within $bcap: open the bank, then re-plan (fires
-  #               right away if the real charges still reach)
-  #   timed S X   X (fire N / open) becomes true before the next check: sleep
-  #               S seconds, then do it
+  # What we can deal in one burst ($cap): crit charges (ours plus what the
+  # woven-in bank will cautiously yield) go to the attacks, counted at the crit
+  # 25th percentile; the rest are normal hits (mean minus 1.5 standard
+  # deviations of their sum). The ultimate isn't counted: it's used as soon
+  # as it's ready. Attacks the bank adds aren't counted either (bonus).
+  # The HP we see is `lag` seconds old and our attacks take FIRE_LEAD to land;
+  # others keep hitting meanwhile. $land = expected HP when the burst arrives.
+  #   fire N      $land is within $cap: fire the woven burst now. N = attacks
+  #               held plus those the bank is expected to add
+  #   timed S N   it will be before the next check: sleep S seconds, then fire
   #   spend       at the attack cap with no crit charges: use one so recharge
   #               isn't wasted (with charges, keep them for the burst)
   #   wait CAP    keep watching
   plan=$(jq -nr --argjson hp "$hp" --argjson left "$left" --argjson per "$per" --argjson crits "$crits" \
-    --argjson banked "$banked" --argjson bankest "$bankest" \
+    --argjson bankest "$bankest" --argjson bankatk "$bankatk" \
     --argjson mean "$HIT_MEAN" --argjson sd "$HIT_SD" --argjson critp "$CRIT_P25" --argjson rate "$rate" \
-    --argjson lead "$(awk -v a="$lag" -v b="$FIRE_LEAD" 'BEGIN{print a+b}')" --argjson olead "$OPEN_LEAD" --argjson poll "$poll" '
-    def cap($ch): ([$ch, $left] | min) as $c | ($left - $c) as $p
-      | ([$p * $mean - 1.5 * $sd * ($p | sqrt), 0] | max + $c * $critp | floor);
-    cap($crits) as $cap
-    | (if $banked > 0 then cap($crits + $bankest) else $cap end) as $bcap
+    --argjson lead "$(awk -v a="$lag" -v b="$FIRE_LEAD" 'BEGIN{print a+b}')" --argjson poll "$poll" '
+    ([$crits + $bankest, $left] | min) as $c | ($left - $c) as $p
+    | ([$p * $mean - 1.5 * $sd * ($p | sqrt), 0] | max + $c * $critp | floor) as $cap
     | ($hp - $rate * $lead) as $land
-    | ($hp - $rate * ($lead + $olead)) as $oland
-    | def eta($x; $c): if $rate > 0 then ($x - $c) / $rate else 1e9 end;
-    if $left <= 0 then "wait \($bcap)"
-    elif $land <= (if $banked > 0 then $cap * 0.8 else $cap end) then "fire \($left)"
-    elif $banked > 0 and $oland <= $bcap then "open"
-    elif $banked > 0 and eta($oland; $bcap) < $poll then "timed \(eta($oland; $bcap) * 1000 | floor / 1000) open"
-    elif eta($land; $cap) < $poll then "timed \(eta($land; $cap) * 1000 | floor / 1000) fire \($left)"
-    elif $left >= $per and $crits == 0 then "spend"
-    else "wait \($bcap)" end')
+    | ($left + $bankatk) as $n
+    | if $left <= 0 then "wait \($cap)"
+      elif $land <= $cap then "fire \($n)"
+      elif $rate > 0 and ($land - $cap) / $rate < $poll then "timed \(($land - $cap) / $rate * 1000 | floor / 1000) \($n)"
+      elif $left >= $per and $crits == 0 then "spend"
+      else "wait \($cap)" end')
 
   case $plan in
     fire*) burst "${plan#fire }"; PREV_HP="" ME_AT=$(now_f) ;;
-    open)
-      log "HOARD: boss $hp HP in reach with the bank ($banked box(es), ~$bankest charge(s)); opening it"
-      open_bank; PREV_HP="" ME_AT=$(now_f) ;; # re-plan right away with the real charges
     timed*)
       set -- ${plan#timed }
-      log "HOARD: boss in reach in ${1}s at -$rate/s; timing the $([[ $2 == open ]] && echo "bank opening" || echo burst)"
+      log "HOARD: boss in reach in ${1}s at -$rate/s; timing the burst"
       nap "$1"
-      if [[ $2 == open ]]; then open_bank; else burst "$3"; fi
-      PREV_HP="" ME_AT=$(now_f) ;;
+      burst "$2"; PREV_HP="" ME_AT=$(now_f) ;;
     spend)
       log "HOARD: at the attack cap ($left), spending one so recharge isn't wasted"
       do_attack normal; PREV_HP="" ME_AT=$(now_f) ;;

@@ -29,6 +29,37 @@ When your shard balance reaches the casket's price, the bot buys one and opens i
 - To buy a different box, set `OMHP_BUY_BOX` to its ID (`wooden_crate`, `iron_chest`, `cursed_casket`, `occult_ossuary`). To turn buying off, set it to an empty string (`OMHP_BUY_BOX=`).
 - If the server refuses a purchase, the bot doesn't retry until your shard count changes, so it can't get stuck retrying the same failed purchase.
 
+### Session summary
+
+Every attack, box opening and purchase is appended to `logs/session-YYYYMMDD-HHMMSS.jsonl`. When the bot stops (Ctrl-C, `kill`, or `systemctl stop`), it prints a summary built from that file:
+
+```
+=============== SESSION SUMMARY ===============
+Duration        1h 2m 5s
+Attacks         6   (normal 3, crit 2, ultimate 1)
+Total damage    11,253
+Avg damage      normal 44   crit 1350   ultimate 8421
+Loot boxes      10 opened  (1 bought for 100 shards)
+  CURSED CASKET x4
+      LEGENDARY x1: GOLDEN SWORD
+      EPIC x2: VOID HAMMER x2
+      crit charges +3
+  IRON CHEST x2
+      ultimate recharge x1
+  WOODEN CRATE x3
+      COMMON x1: RUSTED SWORD (auto-sold)
+      attacks +3
+===============================================
+```
+
+- **Attack types:** "normal" counts only non-crit normal attacks, and "crit" counts normal attacks that crit. Ultimates are counted separately.
+- **Box order:** box types are listed from best to worst, and within each box, items are listed from rarest to most common.
+- **Old sessions:** to re-print the summary of an earlier session, run:
+
+```bash
+./omhp-bot.sh --summary logs/session-20260929-014027.jsonl
+```
+
 ### What it does not do
 
 - It doesn't equip items. Drops go into your bag, and you manage equipment in the web UI.
@@ -61,6 +92,7 @@ When your shard balance reaches the casket's price, the bot buys one and opens i
 | `OMHP_PAUSE`      | `0.4`                       | Seconds between consecutive actions        |
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
 | `OMHP_BUY_BOX`    | `cursed_casket`             | Box to buy with shards; empty disables buying |
+| `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |
 
 ## Example output (illustrative)
 

@@ -4,7 +4,8 @@
 # Loop, driven by the `me` object every API response returns:
 #   1. ultimate available -> use it
 #   2. loot box in bag    -> open it
-#   3. attacks left       -> attack
+#   3. enough shards      -> buy a box (default: cursed casket), opened by step 2
+#   4. attacks left       -> attack
 #   else sleep until the next attack recharges (or poll while the boss is dead)
 #
 # Usage:
@@ -20,6 +21,7 @@ API="${OMHP_API:-https://onemillionhp.com}"
 TOKEN="${OMHP_TOKEN:?set OMHP_TOKEN (localStorage.getItem(\"omhp.token\") in the game tab)}"
 PAUSE="${OMHP_PAUSE:-0.4}"        # seconds between consecutive actions
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
+BUY_BOX="${OMHP_BUY_BOX-cursed_casket}" # box to buy with shards; empty disables buying
 
 log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
 
@@ -66,7 +68,7 @@ handle_error() {
 }
 
 stats() {
-  jq -r '"attacks \(.attacks_left)/\(.attacks_per_day)  boss dmg \(.boss_damage // 0)  boxes \((.boxes // []) | length)  ult \(if .ultimate_available then "READY" elif .ultimate_used then "spent" else "-" end)"' <<<"$ME"
+  jq -r '"attacks \(.attacks_left)/\(.attacks_per_day)  boss dmg \(.boss_damage // 0)  boxes \((.boxes // []) | length)  shards \(.shards // 0)  ult \(if .ultimate_available then "READY" elif .ultimate_used then "spent" else "-" end)"' <<<"$ME"
 }
 
 do_attack() { # kind = normal | ultimate
@@ -96,6 +98,32 @@ do_open_box() {
   fi
 }
 
+# Price of BUY_BOX: me.shop has the admin's price changes applied.
+box_price() { jq -r --arg b "$BUY_BOX" '.shop.boxes[$b] // 100' <<<"$ME"; }
+
+# Set after a refused purchase so we don't retry until the shard count changes.
+BUY_BLOCKED_AT=""
+
+can_buy() {
+  [[ -n $BUY_BOX ]] || return 1
+  local shards
+  shards=$(jq -r '.shards // 0' <<<"$ME")
+  [[ $shards != "$BUY_BLOCKED_AT" ]] && (( shards >= $(box_price) ))
+}
+
+do_buy_box() {
+  local res shards
+  shards=$(jq -r '.shards // 0' <<<"$ME")
+  if res=$(api POST /api/shop/buy "$(jq -nc --arg b "$BUY_BOX" '{box_id:$b}')"); then
+    ME=$(jq -c '.me' <<<"$res")
+    BUY_BLOCKED_AT=""
+    log "BOUGHT $BUY_BOX for $(box_price) shards  ($(jq -r '.shards // 0' <<<"$ME") left)"
+  else
+    BUY_BLOCKED_AT=$shards
+    handle_error "buy($BUY_BOX)" "$res"
+  fi
+}
+
 trap 'log "stopped"; exit 0' INT TERM
 
 refresh || { log "Could not load player. Check OMHP_TOKEN."; exit 1; }
@@ -113,6 +141,8 @@ while true; do
     do_attack ultimate
   elif box=$(jq -er '(.boxes // [])[0].box_id' <<<"$ME"); then
     do_open_box "$box"
+  elif can_buy; then
+    do_buy_box
   elif (( $(jq -r '.attacks_left // 0' <<<"$ME") > 0 )); then
     do_attack normal
   else

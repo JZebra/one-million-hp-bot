@@ -11,12 +11,16 @@
 //        OMHP_PARENT_PID exit when this process is gone
 //
 // OUT_FILE (replaced atomically on every message):
-//   { boss, connected, written, recv, rate, lag, gifts }
+//   { boss, connected, written, recv, rate, steady, lag, gifts }
 //   connected = the socket is open (a quiet boss sends nothing, so an old
 //               `recv` alone doesn't mean the feed is dead)
 //   written   = local unix time of this write (the helper rewrites every 1s)
 //   recv      = local unix time the last message arrived
 //   rate  = HP/s dealt by other players over the last RATE_WINDOW seconds
+//   steady = the same without big hits (crits, ultimates: > OMHP_BIG_HIT,
+//           200). Big hits are rare jumps: during the ~0.5s a burst is in
+//           flight one usually doesn't land, so projecting with `rate` fires
+//           too early.
 //   lag   = how far the stream trails the server (seconds, smoothed)
 //   gifts = count of gift/shards messages (a change means: refresh /api/me)
 // Requires Node 22+ (built-in WebSocket).
@@ -41,6 +45,7 @@ const skew = Number(process.env.OMHP_SKEW || 0);
 const parent = Number(process.env.OMHP_PARENT_PID || 0);
 
 const RATE_WINDOW = 5; // seconds of others' hits used for the damage rate
+const BIG_HIT = Number(process.env.OMHP_BIG_HIT || 200); // left out of `steady`
 
 let boss = null;
 let lag = null;
@@ -60,8 +65,9 @@ function write() {
   // Divide by the time actually observed, so the rate is right just after connecting.
   const span = Math.max(1, Math.min(RATE_WINDOW, now - since));
   const rate = hits.reduce((s, h) => s + h.damage, 0) / span;
+  const steady = hits.reduce((s, h) => s + (h.damage > BIG_HIT ? 0 : h.damage), 0) / span;
   const tmp = `${out}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ boss, connected, written: Date.now() / 1000, recv, rate: Math.round(rate * 10) / 10, lag, gifts }));
+  writeFileSync(tmp, JSON.stringify({ boss, connected, written: Date.now() / 1000, recv, rate: Math.round(rate * 10) / 10, steady: Math.round(steady * 10) / 10, lag, gifts }));
   renameSync(tmp, out);
 }
 

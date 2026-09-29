@@ -6,10 +6,10 @@ A small bash bot that plays [ONE MILLION HP](https://onemillionhp.com) for you.
 
 Every API response includes your updated player state (`me`), and the bot picks its next move from it:
 
-1. **Ultimate available** → use it (unless hoarding, see below).
-2. **Loot box in the bag** → open it.
+1. **Ultimate available** → use it, always. It does damage right away, and your charm's refunds recharge it.
+2. **Loot box in the bag** → open it. Wooden crates and iron chests are the exception: they're banked unopened until hoarding starts (see below).
 3. **Enough shards for a Cursed Casket** (100 by default) → buy one. The next pass opens it through step 2.
-4. **Attacks left** → attack. If the boss is at 1% HP or less, hoard instead (see [Last-hit hoarding](#last-hit-hoarding)).
+4. **Attacks left** → attack. If the boss is at 5% HP or less, hoard instead (see [Last-hit hoarding](#last-hit-hoarding)).
 5. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
 6. **Boss not alive** → check again every 30s until the next boss spawns.
 
@@ -23,25 +23,27 @@ The bot doesn't track any of these counts itself. It reads `ultimate_available` 
 
 ### Last-hit hoarding
 
-When the boss drops to 1% of its HP or less (`OMHP_HOARD_PCT`), the bot stops spending attacks and the ultimate. It saves them for one burst aimed at the killing blow. It keeps opening and buying boxes while it waits, because boxes can give more attacks.
+Other players save their ultimates (900–1900 damage each) and use them at the end. The last real bosses went from 1500–3000 HP to dead in a single ultimate. A burst of 20 normal hits (~430 damage) is too small to compete. Crit charges from loot boxes ("next 3 attacks will crit", ~200–700 damage each) are what make the killing blow reachable. The strategy has three parts:
 
-While hoarding, the bot works out when to fire from four numbers:
+1. **Bank boxes for crit charges.** Wooden crates and iron chests (`OMHP_BANK_BOXES`) stay unopened for the whole boss, up to `OMHP_BANK_MAX` (60). Beyond that, the extras are opened as usual. Cursed caskets and other boxes still open right away. Banking both types yields about 9 crit charges per hour.
+2. **Hoard from 5% boss HP** (`OMHP_HOARD_PCT`). Normal attacks are only spent at the attack cap, so the bank is full when the endgame rush starts. That costs nothing, because recharge keeps flowing. The banked boxes are opened at this point, turning them into crit charges. While charges are banked, the bot doesn't spend attacks even at the cap, because each attack would burn a charge. The ultimate is still used as soon as it's ready.
+3. **Fire everything at the right moment.** The bot predicts the boss's HP when a burst would land. As soon as that's within reach, it fires every held attack at once. Charges apply to the first attacks the server processes.
+
+While hoarding, the bot works out when to fire from these numbers:
 
 - **Boss HP**, from the live feed (below), or from `/api/state` if the feed isn't available.
-- **Other players' damage rate** (HP per second), not counting our own hits.
-- **Our damage per hit**, using a cautious estimate: the 25th percentile of this session's non-crit hits. The ultimate counts as the smallest ultimate seen this session. Before any ultimate this session, it counts as 0.
+- **Other players' steady damage rate** (HP per second), not counting our own hits or big hits (crits and ultimates over 200 damage).
+- **What one burst can deal:** charged attacks count as the 25th percentile of your crits. The remaining attacks count as mean − 1.5 standard deviations of their total. Both figures come from your recent history across all session logs, refreshed once a minute.
 - **How long until a burst lands:** how far behind the live feed is (`lag`), plus how long our requests take to reach the server (`OMHP_FIRE_LEAD`, 0.3s).
-
-From these it predicts the boss's HP at the moment a burst would arrive, and then:
 
 | Situation | Action |
 | --- | --- |
-| That HP is within what we hold | **Fire** enough attacks to kill the HP we currently see, plus `OMHP_BURST_EXTRA` (2), and the ultimate, all in parallel. Attacks that arrive after the kill are rejected. |
-| It will be within reach before the next check | **Time the shot:** sleep exactly until then, then fire everything. |
-| We're at the attack cap | **Spend one attack** so recharge isn't wasted. This also pushes the boss toward kill range if nobody else is attacking. |
+| The predicted HP is within what one burst can deal | **Fire** every held attack in parallel. Attacks that arrive after the kill are rejected. |
+| It will be within reach before the next check | **Time the shot:** sleep exactly until then, then fire. |
+| We're at the attack cap and no charges are banked | **Spend one attack** so recharge isn't wasted. |
 | Otherwise | Keep watching. |
 
-After each boss dies, the bot logs who got the killing blow. The session summary counts your last hits.
+After each boss dies, the bot logs who got the killing blow, and the session summary counts your last hits. Every attack record also stores the boss's HP at that moment, for tuning.
 
 #### Live feed (WebSocket)
 
@@ -55,19 +57,26 @@ If Node isn't installed, is older than 22, or the feed disconnects, hoarding fal
 
 #### How well it works
 
-I tested this against a local simulator of the game, not the real server. The simulated server adds 50–200ms of request latency and a 0.3s feed lag. The simulator's ultimate was turned off so the attacks alone had to land the kill. Last hits out of 6 bosses:
+**Replaying the real endgames.** I rebuilt the last ~600 hits of bosses 13–16 from `/api/feed` and replayed them through the firing rule. The replay models a 0.25s feed lag, 0.25s for our requests to arrive, and your real hit, crit and ultimate damage. The old rule (hoard from 1%, no crit charges) reproduced what actually happened: boss 13 won, 14–16 lost. With 20 banked attacks, win rate by number of crit charges:
 
-| Other players' damage | Live feed | Polling |
+| Crit charges | Boss 13 | Boss 14 | Boss 15 | Boss 16 |
+| --- | --- | --- | --- | --- |
+| 0 | 100% | too late | too late | too late |
+| 3 | 100% | too late | too late | too late |
+| 6 | 100% | too late | too late | 97% |
+| 10 | 100% | 100% | 100% | 100% |
+
+**Simulator.** In a simulated endgame, other players deal a steady 150 HP/s plus an ultimate-sized hit (800–1900) every ~1.2s on average. Last hits out of 6:
+
+| Crit charges | Before the steady-rate fix | After |
 | --- | --- | --- |
-| 300 HP/s | 6/6 | 6/6 |
-| 1000 HP/s | 6/6 | 6/6 |
-| 3000 HP/s | 3/6 | 3/6 |
+| 0 | 1/6 | 2/6 |
+| 6 | 0/6 | 4/6 |
+| 10 | 3/6 | not measured yet |
 
-When I sampled the real boss, other players dealt about 30–560 HP/s. At 3000 HP/s, by the time a burst arrives, someone else often has already killed the boss.
+"Before" projected HP with the average rate, which big hits inflate, so the bot fired while the boss was still out of reach. Big hits are rare jumps, and one usually doesn't land in the ~0.5s a burst is in flight. So the bot now projects with the **steady** rate: the live feed leaves out hits over 200 damage (`OMHP_BIG_HIT`), and polling takes the median of the last 5 samples.
 
-This test favors polling, because the simulated `/api/state` has no lag. The feed's advantages are its damage rate and checking HP 5 times a second without calling the API.
-
-On the real server the results also depend on network latency to the server, on how concurrent attacks from one player are processed, and on whether rejected attacks really cost nothing. Those are assumptions until you've watched a real kill.
+On the real server the results also depend on network latency, on how concurrent attacks from one player are processed, on whether rejected attacks really cost nothing, and on other players changing their own timing.
 
 ### Buying Cursed Caskets
 
@@ -143,10 +152,11 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
 | `OMHP_BUY_BOX`    | `cursed_casket`             | Box to buy with shards; empty disables buying |
 | `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |
-| `OMHP_HOARD_PCT`  | `1`                         | Start hoarding at this % of boss HP; `0` disables hoarding |
-| `OMHP_BURST_EXTRA`| `2`                         | Extra attacks on top of the estimated kill count |
+| `OMHP_HOARD_PCT`  | `5`                         | Start hoarding (and open banked boxes) at this % of boss HP; `0` disables hoarding |
+| `OMHP_BANK_BOXES` | `wooden_crate,iron_chest`   | Box types kept unopened until hoarding; empty disables banking |
+| `OMHP_BANK_MAX`   | `60`                        | Open banked boxes beyond this many |
 | `OMHP_FIRE_LEAD`  | `0.3`                       | Seconds for our attacks to reach the server |
-| `OMHP_HIT_EST`    | `1`                         | Per-hit damage guess before this session has any hits |
+| `OMHP_HIT_EST`    | `20`                        | Per-hit damage guess before the logs have any hits |
 | `OMHP_LIVE`       | `1`                         | Use the WebSocket feed when Node 22+ is available |
 | `OMHP_LIVE_POLL`  | `0.2`                       | Seconds between live-feed reads while hoarding |
 | `OMHP_HOARD_POLL` | `1`                         | Seconds between `/api/state` polls while hoarding without the feed |

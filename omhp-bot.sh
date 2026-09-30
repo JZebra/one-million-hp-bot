@@ -271,8 +271,10 @@ hoarding() {
     and .hp <= .max_hp * $pct / 100' <<<"$BOSS" >/dev/null
 }
 
-# Damage estimates from recent attacks across all session logs, refreshed at
+# Damage estimates from recent attacks (newest session logs), refreshed at
 # most once a minute: mean and spread of non-crit normal hits and of crits.
+# Only hits while the boss was above 10% HP count: below that, executioner
+# gear boosts damage, and hoard_step applies that bonus itself.
 HIT_MEAN=$HIT_EST_DEFAULT HIT_SD=0 CRIT_MEAN=$((HIT_EST_DEFAULT * 12)) CRIT_SD=0 EST_AT=0
 
 update_estimates() {
@@ -280,11 +282,11 @@ update_estimates() {
   (( now - EST_AT < 60 )) && return
   EST_AT=$now
   local est
-  est=$(ls -1t "$LOG_DIR"/session-*.jsonl 2>/dev/null | head -5 | xargs tail -q -n 20000 2>/dev/null | jq -rs \
+  est=$(ls -1t "$LOG_DIR"/session-*.jsonl 2>/dev/null | head -8 | xargs tail -q -n 20000 2>/dev/null | jq -rs \
     --argjson d "$HIT_EST_DEFAULT" '
-    [.[] | select(.t == "attack" and .kind == "normal")] as $a
-    | ($a | map(select(.crit | not) | .damage) | .[-3000:]) as $h
-    | ($a | map(select(.crit) | .damage) | .[-300:]) as $c
+    [.[] | select(.t == "attack" and .kind == "normal" and (.boss_hp == null or .boss_hp > 100000))] | sort_by(.ts) as $a
+    | ($a | map(select(.crit | not) | .damage) | .[-1000:]) as $h
+    | ($a | map(select(.crit) | .damage) | .[-150:]) as $c
     | def sd($x; $m): $x | map(. * .) | add / length - $m * $m | if . < 0 then 0 else sqrt end;
     (if ($h | length) > 20 then ($h | add / length) else $d end) as $m
     | (if ($h | length) > 20 then sd($h; $m) else 0 end) as $sd
@@ -295,9 +297,12 @@ update_estimates() {
 }
 
 # box_to_open: the next box to open, if any. Banked types stay shut (they're
-# woven into the kill burst) unless the bank passes BANK_MAX;
-# everything else opens right away.
+# woven into the kill burst) unless the bank passes BANK_MAX; everything else
+# opens right away. While hoarding, nothing opens: a box's crit charge would
+# stop the bot from spending at the attack cap (wasting recharge), so every
+# box waits for the burst.
 box_to_open() {
+  hoarding && return 1
   jq -er --arg bank "$BANK_BOXES" --argjson all false --argjson max "$BANK_MAX" '
     ($bank | split(",") | map(select(. != ""))) as $bk
     | (.boxes // []) as $b
@@ -307,15 +312,14 @@ box_to_open() {
       // (if $all or $held > $max then $banked[0].box_id else empty end)' <<<"$ME"
 }
 
-# bank_estimate: "COUNT CHARGES VAR ATTACKS" = banked boxes, the crit charges
-# opening them all is expected to yield (from the game's box odds) and its
-# variance, and the attacks they're expected to add.
+# bank_estimate: "COUNT CHARGES VAR ATTACKS" for every box in the bag (all of
+# them go into the burst): the crit charges opening them is expected to yield
+# (from the game's box odds) and its variance, and the attacks they add.
 bank_estimate() {
-  jq -r --arg bank "$BANK_BOXES" --argjson ct "$CONTENT" '($bank | split(",")) as $bk
-    | [(.boxes // [])[] | select(.box_id as $i | $bk | index($i))] as $b
+  jq -r --argjson ct "$CONTENT" '[(.boxes // [])[]] as $b
     | ($b | map(.count // 1) | add // 0) as $n
     # Fallback odds (from /api/content at the time of writing) if content failed to load.
-    | {wooden_crate: {mean: 0.185, m2: 0.185}, iron_chest: {mean: 0.375, m2: 0.75}} as $fb
+    | {wooden_crate: {mean: 0.185, m2: 0.185}, iron_chest: {mean: 0.375, m2: 0.75}, cursed_casket: {mean: 0.75, m2: 2.25}} as $fb
     | {wooden_crate: 0.598, iron_chest: 0.7} as $fba
     | ($b | map((($ct.box_crit // {})[.box_id] // $fb[.box_id] // {mean: 0, m2: 0}) as $o | {n: (.count // 1), mean: $o.mean, var: ($o.m2 - $o.mean * $o.mean)})) as $x
     | ($x | map(.n * .mean) | add // 0) as $m
@@ -324,21 +328,14 @@ bank_estimate() {
     | "\($n) \($m * 100 | round / 100) \($v * 100 | round / 100) \($atk | floor)"' <<<"$ME"
 }
 
-# How many boxes are banked (for the status line).
-banked_count() {
-  jq -r --arg bank "$BANK_BOXES" '($bank | split(",")) as $bk
-    | [(.boxes // [])[] | select(.box_id as $i | $bk | index($i)) | .count // 1] | add // 0' <<<"$ME"
-}
-
-# burst N: fire N attacks at once, woven with opening every banked box
+# burst N: fire N attacks at once, woven with opening every box in the bag
 # (open, attack, open, attack...): each crit charge lands just before the
 # attacks that use it. Attack requests beyond what we end up having are
 # rejected with NO_ATTACKS.
 burst() {
   local n=$1 dir i=0 j kind f id ids pids=() t0
   t0=$(now_f)
-  ids=($(jq -r --arg bank "$BANK_BOXES" '($bank | split(",")) as $bk
-    | (.boxes // [])[] | select(.box_id as $i | $bk | index($i)) | .box_id as $id | range(.count // 1) | $id' <<<"$ME"))
+  ids=($(jq -r '(.boxes // [])[] | .box_id as $id | range(.count // 1) | $id' <<<"$ME"))
   dir=$(mktemp -d)
   log "BURST: $n attack(s) woven with ${#ids[@]} banked box(es), $(jq -r '.next_crits // 0' <<<"$ME") crit charge(s) at $(jq -r '.hp' <<<"$BOSS") HP"
   for ((j = 0; j < n || j < ${#ids[@]}; j++)); do
@@ -468,7 +465,8 @@ hoard_step() {
   # how many charges the bank gives. $cap = mean - MARGIN_SD standard
   # deviations. (Counting each crit at a low percentile instead made the
   # bot wait for HP that other players' ultimates never left us.) The
-  # ultimate isn't counted: it's used as soon as it's ready.
+  # ultimate isn't counted: it's used as soon as it's ready. Below 10% boss HP
+  # every hit gets the executioner bonus from our gear (me.mods.executioner).
   # The HP we see is `lag` seconds old and our attacks take FIRE_LEAD to land;
   # others keep hitting meanwhile. $land = expected HP when the burst arrives.
   #   fire N      $land is within $cap: fire the woven burst now. N = attacks
@@ -481,8 +479,12 @@ hoard_step() {
     --argjson bankest "$bankest" --argjson bankvar "$bankvar" --argjson bankatk "$bankatk" \
     --argjson mean "$HIT_MEAN" --argjson sd "$HIT_SD" --argjson cmean "$CRIT_MEAN" --argjson csd "$CRIT_SD" \
     --argjson z "$MARGIN_SD" --argjson rate "$rate" \
+    --argjson exe "$(jq -r --argjson max "$(jq -r '.max_hp // 1000000' <<<"$BOSS")" --argjson hp "$hp" \
+      'if $hp < $max * 0.1 then (.mods.executioner // 0) else 0 end' <<<"$ME")" \
     --argjson lead "$(awk -v a="$lag" -v b="$FIRE_LEAD" 'BEGIN{print a+b}')" --argjson poll "$poll" '
-    ($left + $bankatk) as $n
+    ($mean * (1 + $exe)) as $mean | ($sd * (1 + $exe)) as $sd
+    | ($cmean * (1 + $exe)) as $cmean | ($csd * (1 + $exe)) as $csd
+    | ($left + $bankatk) as $n
     | ([$crits + $bankest, $n] | min) as $c
     | ($c * $cmean + ($n - $c) * $mean) as $bm
     | ($c * $csd * $csd + ($n - $c) * $sd * $sd + $bankvar * ($cmean - $mean) * ($cmean - $mean)) as $bv

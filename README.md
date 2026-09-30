@@ -33,7 +33,7 @@ While hoarding, the bot works out when to fire from these numbers:
 
 - **Boss HP**, from the live feed (below), or from `/api/state` if the feed isn't available.
 - **Other players' steady damage rate** (HP per second), not counting our own hits or big hits (crits and ultimates over 200 damage).
-- **What one burst can deal**, estimated as one sum: every attack in the burst (the ones held plus the ones the bank is expected to add), with crit charges (existing ones plus the bank's expected yield from the game's box odds) on some of them. The mean and spread of your crits and normal hits come from your most recent 1,000 hits and 150 crits in the session logs (only while the boss was above 10% HP), refreshed once a minute. Below 10% HP every hit also gets your gear's executioner bonus (`me.mods.executioner`, +25% for THE UNWRITTEN END), which the estimate applies on top. The reach is the burst's mean minus `OMHP_MARGIN_SD` (1.5) standard deviations, so about 93% of bursts deal at least that much. For a 55-box bank and 20 held attacks, that's ~3,200 HP.
+- **What one burst can deal**, estimated as one sum: every attack in the burst (the ones held plus the ones the bank is expected to add), with crit charges (existing ones plus the bank's expected yield from the game's box odds) on some of them. The mean and spread of your crits and normal hits come from your most recent 1,000 hits and 150 crits in the session logs (only while the boss was above 10% HP), refreshed once a minute. Below 10% HP every hit also gets your gear's executioner bonus (`me.mods.executioner`, +25% for THE UNWRITTEN END), which the estimate applies on top. The reach is the burst's mean minus `OMHP_MARGIN_SD` (0.5) standard deviations, so about 69% of bursts deal at least that much. For a 30-box bank and 20 held attacks, that's ~3,800 HP.
 - **How long until a burst lands:** how far behind the live feed is (`lag`), plus how long our requests take to reach the server (`OMHP_FIRE_LEAD`, 0.3s).
 
 | Situation | Action |
@@ -84,6 +84,19 @@ If Node isn't installed, is older than 22, or the feed disconnects, hoarding fal
 | 0 | ~5,400 | 49% | 54% | 51% | 73% | 52% | 56% |
 
 At 1.5 none of the five were too late. Lower values fire earlier, but more bursts fall short.
+
+**Boss 21 (real) and the 30-box bank.** Boss 21 sat at 4,000–6,000 HP for ~20s, then six big hits in the last second took it from 4,381 to dead. With the bank cut to 30 boxes, a 1.5-sd margin put the reach at only ~2,200, and the burst went out as the boss died. Replaying bosses 13–16, 18 and 21 with the current damage (crits ~550 with executioner):
+
+| Bank | `OMHP_MARGIN_SD` | Reach | Avg win | Too late |
+| --- | --- | --- | --- | --- |
+| 30 boxes | 1.5 | ~2,200 | 49% | 3 of 6 |
+| 30 boxes | 1.0 | ~3,000 | 76% | 1 of 6 |
+| 30 boxes | **0.5** (default) | ~3,800 | **81%** | 0 |
+| 30 boxes | 0 | ~4,600 | 59% | 0 |
+| 60 boxes | 1.5 | ~5,300 | **96%** | 0 |
+| 60 boxes | 0.5 | ~7,600 | 74% | 0 |
+
+The bank size matters more than the margin: `OMHP_BANK_MAX=60 OMHP_MARGIN_SD=1.5` wins most often, at the cost of keeping twice as many boxes unopened during the boss.
 
 **Bank woven into the burst** (same simulated endgame, 40 crates and 15 chests banked, 0 charges to start): **6/6** last hits. Each burst took ~0.63s. The 55 box opens made 9–15 crit charges, and the boss died after 4–25 of our hits, 1–4 of them crits. Opening the whole bank first and then firing managed 4/6: the 0.7–0.8s it took to open let other players' hits land first. Charges left over when the boss dies carry into the next boss and go on your first normal attacks there.
 
@@ -173,7 +186,7 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_BIG_HIT`    | `200`                       | Other players' hits above this are left out of the steady damage rate |
 | `OMHP_FIRE_LEAD`  | `0.3`                       | Seconds for our attacks to reach the server |
 | `OMHP_HIT_EST`    | `20`                        | Per-hit damage guess before the logs have any hits |
-| `OMHP_MARGIN_SD`  | `1.5`                       | Fire when the predicted HP is within the burst's mean minus this many standard deviations; lower fires earlier |
+| `OMHP_MARGIN_SD`  | `0.5`                       | Fire when the predicted HP is within the burst's mean minus this many standard deviations; lower fires earlier |
 | `OMHP_LIVE`       | `1`                         | Use the WebSocket feed when Node 22+ is available |
 | `OMHP_LIVE_POLL`  | `0.2`                       | Seconds between live-feed reads while hoarding |
 | `OMHP_HOARD_POLL` | `1`                         | Seconds between `/api/state` polls while hoarding without the feed |

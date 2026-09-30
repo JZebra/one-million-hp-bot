@@ -8,7 +8,7 @@ Every API response includes your updated player state (`me`), and the bot picks 
 
 1. **Ultimate available** → use it, always. It does damage right away, and your charm's refunds recharge it.
 2. **Loot box in the bag** → open it. Wooden crates and iron chests are the exception: they're banked unopened until the kill attempt itself (see below).
-3. **Enough shards for a Cursed Casket** (100 by default) → buy one. The next pass opens it through step 2.
+3. **Enough shards for an Occult Ossuary** (500 by default) → buy one. The next pass opens it through step 2.
 4. **Attacks left** → attack. If the boss is at 5% HP or less, hoard instead (see [Last-hit hoarding](#last-hit-hoarding)).
 5. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
 6. **Boss not alive** → check again every 30s until the next boss spawns.
@@ -25,7 +25,7 @@ The bot doesn't track any of these counts itself. It reads `ultimate_available` 
 
 Other players save their ultimates (900–1900 damage each) and use them at the end. The last real bosses went from 1500–3000 HP to dead in a single ultimate. A burst of 20 normal hits (~430 damage) is too small to compete. Crit charges from loot boxes ("next 3 attacks will crit", ~200–700 damage each) are what make the killing blow reachable. The strategy has three parts:
 
-1. **Bank boxes for crit charges.** Wooden crates and iron chests (`OMHP_BANK_BOXES`) stay unopened, up to `OMHP_BANK_MAX` (60). Beyond that, the extras are opened as usual. Cursed caskets and other boxes still open right away. Banking both types yields about 9 crit charges per hour.
+1. **Bank boxes for crit charges.** Wooden crates and iron chests (`OMHP_BANK_BOXES`) stay unopened, up to `OMHP_BANK_MAX` (30). Beyond that, the extras are opened as usual. Other boxes (ossuaries, cursed caskets) still open right away. A full bank of 30 is worth about 7 crit charges on average; the replayed endgames were won with 6–10.
 2. **Hoard from 5% boss HP** (`OMHP_HOARD_PCT`). Normal attacks are only spent at the attack cap, so the bank is full when the endgame rush starts. That costs nothing, because recharge keeps flowing. If a charge does exist (from a cursed casket, say), the bot stops spending even at the cap, because the game would spend the charge on the next attack. The ultimate is still used as soon as it's ready. While hoarding, no box is opened at all, including cursed caskets bought during the hoard: a crit charge would stop the bot from spending at the attack cap and waste recharge. Every box in the bag goes into the burst.
 3. **Weave the bank into the burst.** The game spends crit charges on your very next attacks, so the banked boxes stay shut until the kill attempt itself. The bot predicts the boss's HP when a burst would land. Once that's within reach of a burst with the charges the bank will likely produce, it fires one burst that alternates box opens and attacks (open, attack, open, attack…), all in parallel. Box opens and attacks are separate endpoints with their own rate limits, so weaving adds no time, and each charge is created just before the attacks that use it. The burst sends the attacks you hold plus the ones the bank is expected to add; any extra attack requests are rejected. If someone else kills the boss first, nothing is lost: the boxes stay banked for the next boss.
 
@@ -91,11 +91,13 @@ At 1.5 none of the five were too late. Lower values fire earlier, but more burst
 
 On the real server the results also depend on network latency, on how concurrent attacks from one player are processed, on whether rejected attacks really cost nothing, and on other players changing their own timing.
 
-### Buying Cursed Caskets
+### Buying Occult Ossuaries
 
-When your shard balance reaches the casket's price, the bot buys one and opens it right away. It keeps buying as long as you can afford another, so 250 shards gets you two caskets, with 50 shards left over.
+When your shard balance reaches the ossuary's price (500), the bot buys one and opens it right away. It keeps buying as long as you can afford another. While hoarding, bought boxes stay shut and go into the kill burst.
 
-- The price comes from `me.shop.boxes`, which includes any price changes the admin makes. If that field is missing, the bot assumes 100.
+The ossuary's loot table was updated to drop godly items more often: epic 64.4%, legendary 28%, mythic 5.6%, **godly 1.9%**. Per shard, that's about 5× the cursed casket's godly odds (the casket is 0.1% godly at 100 shards). The casket is still better per shard for mythics (2.3% at 100) and gives crit charges; set `OMHP_BUY_BOX=cursed_casket` to go back to it.
+
+- The price comes from `me.shop.boxes`, which includes any price changes the admin makes. If that field is missing, the bot uses the shop list at the time of writing (crate 10, chest 30, casket 100, ossuary 500).
 - To buy a different box, set `OMHP_BUY_BOX` to its ID (`wooden_crate`, `iron_chest`, `cursed_casket`, `occult_ossuary`). To turn buying off, set it to an empty string (`OMHP_BUY_BOX=`).
 - If the server refuses a purchase, the bot doesn't retry until your shard count changes, so it can't get stuck retrying the same failed purchase.
 
@@ -163,11 +165,11 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_API`        | `https://onemillionhp.com`  | API origin                                 |
 | `OMHP_PAUSE`      | `0.4`                       | Seconds between consecutive actions        |
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
-| `OMHP_BUY_BOX`    | `cursed_casket`             | Box to buy with shards; empty disables buying |
+| `OMHP_BUY_BOX`    | `occult_ossuary`            | Box to buy with shards; empty disables buying |
 | `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |
 | `OMHP_HOARD_PCT`  | `5`                         | Start hoarding at this % of boss HP; `0` disables hoarding |
 | `OMHP_BANK_BOXES` | `wooden_crate,iron_chest`   | Box types kept unopened until hoarding; empty disables banking |
-| `OMHP_BANK_MAX`   | `60`                        | Open banked boxes beyond this many |
+| `OMHP_BANK_MAX`   | `30`                        | Open banked boxes beyond this many |
 | `OMHP_BIG_HIT`    | `200`                       | Other players' hits above this are left out of the steady damage rate |
 | `OMHP_FIRE_LEAD`  | `0.3`                       | Seconds for our attacks to reach the server |
 | `OMHP_HIT_EST`    | `20`                        | Per-hit damage guess before the logs have any hits |

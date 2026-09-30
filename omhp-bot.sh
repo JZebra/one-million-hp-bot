@@ -4,7 +4,7 @@
 # Loop, driven by the `me` object every API response returns:
 #   1. ultimate available -> use it
 #   2. loot box in bag    -> open it
-#   3. enough shards      -> buy a box (default: cursed casket), opened by step 2
+#   3. enough shards      -> buy a box (default: occult ossuary), opened by step 2
 #   4. attacks left       -> attack
 #   else sleep until the next attack recharges (or poll while the boss is dead)
 #
@@ -41,10 +41,10 @@ set -uo pipefail
 API="${OMHP_API:-https://onemillionhp.com}"
 PAUSE="${OMHP_PAUSE:-0.4}"        # seconds between consecutive actions
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
-BUY_BOX="${OMHP_BUY_BOX-cursed_casket}" # box to buy with shards; empty disables buying
+BUY_BOX="${OMHP_BUY_BOX-occult_ossuary}" # box to buy with shards; empty disables buying
 HOARD_PCT="${OMHP_HOARD_PCT:-5}"      # start hoarding at this % boss HP; 0 disables
 BANK_BOXES="${OMHP_BANK_BOXES-wooden_crate,iron_chest}" # boxes kept unopened until hoarding
-BANK_MAX="${OMHP_BANK_MAX:-60}"       # open banked boxes beyond this many
+BANK_MAX="${OMHP_BANK_MAX:-30}"       # open banked boxes beyond this many
 HOARD_POLL="${OMHP_HOARD_POLL:-1}"    # seconds between boss HP checks while hoarding
 HIT_EST_DEFAULT="${OMHP_HIT_EST:-20}" # per-hit damage guess until the logs have data
 MARGIN_SD="${OMHP_MARGIN_SD:-1.5}"    # fire when HP <= burst mean - this many sd (1.5 = ~93% sure)
@@ -235,8 +235,11 @@ do_open_box() {
   fi
 }
 
-# Price of BUY_BOX: me.shop has the admin's price changes applied.
-box_price() { jq -r --arg b "$BUY_BOX" '.shop.boxes[$b] // 100' <<<"$ME"; }
+# Price of BUY_BOX: me.shop has the admin's price changes applied; the
+# fallback is the shop list at the time of writing.
+box_price() {
+  jq -r --arg b "$BUY_BOX" '.shop.boxes[$b] // ({wooden_crate: 10, iron_chest: 30, cursed_casket: 100, occult_ossuary: 500}[$b]) // 100' <<<"$ME"
+}
 
 # Set after a refused purchase so we don't retry until the shard count changes.
 BUY_BLOCKED_AT=""

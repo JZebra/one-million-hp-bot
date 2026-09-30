@@ -44,11 +44,11 @@ DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is aliv
 BUY_BOX="${OMHP_BUY_BOX-occult_ossuary}" # box to buy with shards; empty disables buying
 HOARD_PCT="${OMHP_HOARD_PCT:-5}"      # start hoarding at this % boss HP; 0 disables
 BANK_BOXES="${OMHP_BANK_BOXES-wooden_crate,iron_chest}" # boxes kept unopened until hoarding
-BANK_MAX="${OMHP_BANK_MAX:-30}"       # open banked boxes beyond this many
+BANK_MAX="${OMHP_BANK_MAX:-50}"       # open banked boxes beyond this many
 HOARD_POLL="${OMHP_HOARD_POLL:-1}"    # seconds between boss HP checks while hoarding
 HIT_EST_DEFAULT="${OMHP_HIT_EST:-20}" # per-hit damage guess until the logs have data
-MARGIN_SD="${OMHP_MARGIN_SD:-0.5}"    # fire when HP <= burst mean - this many sd (0.5 = ~69% sure)
-                                      # 0.5 suits the 30-box bank; with BANK_MAX=60, 1.5 did best
+MARGIN_SD="${OMHP_MARGIN_SD:-1.5}"    # fire when HP <= burst mean - this many sd (1.5 = ~93% sure)
+                                      # 1.5 suits the 50-box bank; with a 30-box bank, 0.5 did best
 LIVE="${OMHP_LIVE:-1}"                # 1 = use the WebSocket feed when Node 22+ is available
 LIVE_POLL="${OMHP_LIVE_POLL:-0.2}"    # seconds between live-feed reads while hoarding
 FIRE_LEAD="${OMHP_FIRE_LEAD:-0.3}"    # seconds for our attacks to reach the server

@@ -25,7 +25,7 @@ The bot doesn't track any of these counts itself. It reads `ultimate_available` 
 
 Other players save their ultimates (900–1900 damage each) and use them at the end. The last real bosses went from 1500–3000 HP to dead in a single ultimate. A burst of 20 normal hits (~430 damage) is too small to compete. Crit charges from loot boxes ("next 3 attacks will crit", ~200–700 damage each) are what make the killing blow reachable. The strategy has three parts:
 
-1. **Bank boxes for crit charges.** Wooden crates and iron chests (`OMHP_BANK_BOXES`) stay unopened, up to `OMHP_BANK_MAX` (30). Beyond that, the extras are opened as usual. Other boxes (ossuaries, cursed caskets) still open right away. A full bank of 30 is worth about 7 crit charges on average; the replayed endgames were won with 6–10.
+1. **Bank boxes for crit charges.** Wooden crates and iron chests (`OMHP_BANK_BOXES`) stay unopened, up to `OMHP_BANK_MAX` (50). Beyond that, the extras are opened as usual. Other boxes (ossuaries, cursed caskets) still open right away. A full bank of 50 (about 36 crates and 14 chests) is worth about 12 crit charges and 30 attacks on average.
 2. **Hoard from 5% boss HP** (`OMHP_HOARD_PCT`). Normal attacks are only spent at the attack cap, so the bank is full when the endgame rush starts. That costs nothing, because recharge keeps flowing. If a charge does exist (from a cursed casket, say), the bot stops spending even at the cap, because the game would spend the charge on the next attack. The ultimate is still used as soon as it's ready. While hoarding, no box is opened at all, including cursed caskets bought during the hoard: a crit charge would stop the bot from spending at the attack cap and waste recharge. Every box in the bag goes into the burst.
 3. **Weave the bank into the burst.** The game spends crit charges on your very next attacks, so the banked boxes stay shut until the kill attempt itself. The bot predicts the boss's HP when a burst would land. Once that's within reach of a burst with the charges the bank will likely produce, it fires one burst that alternates box opens and attacks (open, attack, open, attack…), all in parallel. Box opens and attacks are separate endpoints with their own rate limits, so weaving adds no time, and each charge is created just before the attacks that use it. The burst sends the attacks you hold plus the ones the bank is expected to add; any extra attack requests are rejected. If someone else kills the boss first, nothing is lost: the boxes stay banked for the next boss.
 
@@ -33,7 +33,7 @@ While hoarding, the bot works out when to fire from these numbers:
 
 - **Boss HP**, from the live feed (below), or from `/api/state` if the feed isn't available.
 - **Other players' steady damage rate** (HP per second), not counting our own hits or big hits (crits and ultimates over 200 damage).
-- **What one burst can deal**, estimated as one sum: every attack in the burst (the ones held plus the ones the bank is expected to add), with crit charges (existing ones plus the bank's expected yield from the game's box odds) on some of them. The mean and spread of your crits and normal hits come from your most recent 1,000 hits and 150 crits in the session logs (only while the boss was above 10% HP), refreshed once a minute. Below 10% HP every hit also gets your gear's executioner bonus (`me.mods.executioner`, +25% for THE UNWRITTEN END), which the estimate applies on top. The reach is the burst's mean minus `OMHP_MARGIN_SD` (0.5) standard deviations, so about 69% of bursts deal at least that much. For a 30-box bank and 20 held attacks, that's ~3,800 HP.
+- **What one burst can deal**, estimated as one sum: every attack in the burst (the ones held plus the ones the bank is expected to add), with crit charges (existing ones plus the bank's expected yield from the game's box odds) on some of them. The mean and spread of your crits and normal hits come from your most recent 1,000 hits and 150 crits in the session logs (only while the boss was above 10% HP), refreshed once a minute. Below 10% HP every hit also gets your gear's executioner bonus (`me.mods.executioner`, +25% for THE UNWRITTEN END), which the estimate applies on top. The reach is the burst's mean minus `OMHP_MARGIN_SD` (1.5) standard deviations, so about 93% of bursts deal at least that much. For a 50-box bank and 20 held attacks, that's ~4,300 HP.
 - **How long until a burst lands:** how far behind the live feed is (`lag`), plus how long our requests take to reach the server (`OMHP_FIRE_LEAD`, 0.3s).
 
 | Situation | Action |
@@ -91,12 +91,15 @@ At 1.5 none of the five were too late. Lower values fire earlier, but more burst
 | --- | --- | --- | --- | --- |
 | 30 boxes | 1.5 | ~2,200 | 49% | 3 of 6 |
 | 30 boxes | 1.0 | ~3,000 | 76% | 1 of 6 |
-| 30 boxes | **0.5** (default) | ~3,800 | **81%** | 0 |
+| 30 boxes | 0.5 | ~3,800 | 81% | 0 |
 | 30 boxes | 0 | ~4,600 | 59% | 0 |
-| 60 boxes | 1.5 | ~5,300 | **96%** | 0 |
+| **50 boxes** | 2.0 | ~3,200 | 100% | 0 (fires at the edge of the final rush) |
+| **50 boxes** | **1.5** (default) | ~4,300 | **97%** | 0 |
+| **50 boxes** | 1.0 | ~5,300 | 86% | 0 |
+| 60 boxes | 1.5 | ~5,300 | 96% | 0 |
 | 60 boxes | 0.5 | ~7,600 | 74% | 0 |
 
-The bank size matters more than the margin: `OMHP_BANK_MAX=60 OMHP_MARGIN_SD=1.5` wins most often, at the cost of keeping twice as many boxes unopened during the boss.
+The bank size matters more than the margin, so the defaults are now a 50-box bank with a 1.5-sd margin (97%). With a smaller bank, lower the margin to match (30 boxes: `OMHP_MARGIN_SD=0.5`).
 
 **Bank woven into the burst** (same simulated endgame, 40 crates and 15 chests banked, 0 charges to start): **6/6** last hits. Each burst took ~0.63s. The 55 box opens made 9–15 crit charges, and the boss died after 4–25 of our hits, 1–4 of them crits. Opening the whole bank first and then firing managed 4/6: the 0.7–0.8s it took to open let other players' hits land first. Charges left over when the boss dies carry into the next boss and go on your first normal attacks there.
 
@@ -182,11 +185,11 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |
 | `OMHP_HOARD_PCT`  | `5`                         | Start hoarding at this % of boss HP; `0` disables hoarding |
 | `OMHP_BANK_BOXES` | `wooden_crate,iron_chest`   | Box types kept unopened until hoarding; empty disables banking |
-| `OMHP_BANK_MAX`   | `30`                        | Open banked boxes beyond this many |
+| `OMHP_BANK_MAX`   | `50`                        | Open banked boxes beyond this many |
 | `OMHP_BIG_HIT`    | `200`                       | Other players' hits above this are left out of the steady damage rate |
 | `OMHP_FIRE_LEAD`  | `0.3`                       | Seconds for our attacks to reach the server |
 | `OMHP_HIT_EST`    | `20`                        | Per-hit damage guess before the logs have any hits |
-| `OMHP_MARGIN_SD`  | `0.5`                       | Fire when the predicted HP is within the burst's mean minus this many standard deviations; lower fires earlier |
+| `OMHP_MARGIN_SD`  | `1.5`                       | Fire when the predicted HP is within the burst's mean minus this many standard deviations; lower fires earlier |
 | `OMHP_LIVE`       | `1`                         | Use the WebSocket feed when Node 22+ is available |
 | `OMHP_LIVE_POLL`  | `0.2`                       | Seconds between live-feed reads while hoarding |
 | `OMHP_HOARD_POLL` | `1`                         | Seconds between `/api/state` polls while hoarding without the feed |

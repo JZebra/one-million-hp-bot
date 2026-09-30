@@ -7,11 +7,12 @@ A small bash bot that plays [ONE MILLION HP](https://onemillionhp.com) for you.
 Every API response includes your updated player state (`me`), and the bot picks its next move from it:
 
 1. **Ultimate available** → use it, always. (The game removed the ultimate on 2026-09-29, replacing the button with scrolls. If the server refuses an ultimate, the bot stops trying for `OMHP_ULT_BACKOFF` seconds, 600, instead of retrying it on every pass, which had stalled all attacks.)
-2. **Loot box in the bag** → open it. Wooden crates and iron chests are the exception: they're banked unopened until the kill attempt itself (see below).
-3. **Enough shards for an Occult Ossuary** (500 by default) → buy one. The next pass opens it through step 2.
-4. **Attacks left** → attack. If the boss is at 5% HP or less, hoard instead (see [Last-hit hoarding](#last-hit-hoarding)).
-5. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
-6. **Boss not alive** → check again every 30s until the next boss spawns.
+2. **Scroll owned** → use it right away. Scrolls replaced the ultimate and drop from attacks (freezing, poison, treasure, attack steal, boss heal). If the server refuses one (boss heal only works at 89% boss HP or lower), that scroll is set aside for 2 minutes instead of being retried every pass. Scrolls used are listed in the session summary.
+3. **Loot box in the bag** → open it. Wooden crates and iron chests are the exception: they're banked unopened until the kill attempt itself (see below).
+4. **Enough shards for an Occult Ossuary** (500 by default) → buy one. The next pass opens it through step 3.
+5. **Attacks left** → attack. If the boss is at 5% HP or less, hoard instead (see [Last-hit hoarding](#last-hit-hoarding)).
+6. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
+7. **Boss not alive** → check again every 30s until the next boss spawns.
 
 Attacks recharge one every 5s, up to 20 stored.
 
@@ -216,6 +217,7 @@ These are the endpoints the game's own web client uses, found by reading `js/api
 | Call                       | Body                                   |
 | -------------------------- | -------------------------------------- |
 | `GET  /api/me`             | (none)                                 |
+| `POST /api/scrolls/use`    | `{ "scroll_id": string }`              |
 | `GET  /api/state`          | (none; public; includes `server_time` and `boss`) |
 | `WS   /api/live`           | Push stream: `snapshot`, then an `update` per attack with `boss` and `events` (`t`, `player_id`, `damage`); also `gift` and `shards`. Send `{"type":"auth","token":...}` to be told about gifts. |
 | `POST /api/attack`         | `{ "kind": "normal" \| "ultimate", "request_id": uuid }` |

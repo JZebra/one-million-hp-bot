@@ -3,6 +3,7 @@
 #
 # Loop, driven by the `me` object every API response returns:
 #   1. ultimate available -> use it
+#      scroll owned        -> use it (scrolls replaced the ultimate)
 #   2. loot box in bag    -> open it
 #   3. enough shards      -> buy a box (default: occult ossuary), opened by step 2
 #   4. attacks left       -> attack
@@ -86,6 +87,7 @@ summarize() {
         "Attacks         \($atk | length | c)   (normal \($norm | length | c), crit \($crit | length | c), ultimate \($ult | length | c))",
         "Total damage    \($atk | map(.damage) | add // 0 | c)",
         "Avg damage      normal \($norm | avg)   crit \($crit | avg)   ultimate \($ult | avg)",
+        "Scrolls used    \(map(select(.t == "scroll")) | if length == 0 then "none" else (group_by(.scroll_id) | map("\(.[0].scroll_id) x\(length)") | join(", ")) end)",
         "Last hits       \($kills | map(select(.mine)) | length) of \($kills | length) boss kill(s) seen",
         "Loot boxes      \($boxes | length) opened\(if ($buys | length) > 0 then "  (\($buys | length) bought for \($buys | map(.price) | add | c) shards)" else "" end)",
         ( $boxes
@@ -185,7 +187,7 @@ handle_error() {
 }
 
 stats() {
-  jq -r '"attacks \(.attacks_left)/\(.attacks_per_day)  boss dmg \(.boss_damage // 0)  boxes \([(.boxes // [])[] | .count // 1] | add // 0)  crits \(.next_crits // 0)  shards \(.shards // 0)  ult \(if .ultimate_available then "READY" elif .ultimate_used then "spent" else "-" end)"' <<<"$ME"
+  jq -r '"attacks \(.attacks_left)/\(.attacks_per_day)  boss dmg \(.boss_damage // 0)  boxes \([(.boxes // [])[] | .count // 1] | add // 0)  crits \(.next_crits // 0)  scrolls \([(.scrolls // [])[] | .count // 1] | add // 0)  shards \(.shards // 0)  ult \(if .ultimate_available then "READY" elif .ultimate_used then "spent" else "-" end)"' <<<"$ME"
 }
 
 # ---------------------------------------------------------------- actions
@@ -248,6 +250,31 @@ do_open_box() {
     log "OPENED $box -> $(jq -c '.result' <<<"$res")"
   else
     handle_error "open($box)" "$res"
+  fi
+}
+
+# ---- scrolls (drop from attacks; used as soon as we have one)
+
+SCROLL_BLOCKED="" # "id:until ..." for scrolls the server refused, retried after 120s
+
+scroll_to_use() {
+  jq -er --arg blocked "$SCROLL_BLOCKED" --argjson now "$(date +%s)" '
+    ($blocked | split(" ") | map(select(. != "") | split(":") | {key: .[0], value: (.[1] | tonumber)}) | from_entries) as $b
+    | [(.scrolls // [])[] | select((.count // 1) > 0 and (($b[.scroll_id] // 0) <= $now)) | .scroll_id][0] // empty' <<<"$ME"
+}
+
+do_use_scroll() {
+  local id=$1 res
+  if res=$(api POST /api/scrolls/use "$(jq -nc --arg s "$id" '{scroll_id: $s}')"); then
+    ME=$(jq -c '.me // empty' <<<"$res"); [[ -n $ME ]] || refresh
+    local b; b=$(jq -c '.boss // empty' <<<"$res"); [[ -n $b ]] && BOSS=$b
+    record "$(jq -c --arg s "$id" '{t: "scroll", scroll_id: $s, amount: .amount, shards: .shards}' <<<"$res")"
+    log "SCROLL: used $id$(jq -r 'if .amount then " (amount \(.amount))" else "" end + if .shards then " +\(.shards) shards" else "" end' <<<"$res")"
+  else
+    SCROLL_BLOCKED="$SCROLL_BLOCKED $id:$(( $(date +%s) + 120 ))"
+    log "scroll $id refused ($(error_code "$res")): $(jq -r '.error.message // empty' <<<"$res"); retrying in 120s"
+    [[ $(error_code "$res") == NETWORK ]] && nap 5
+    refresh || nap 5
   fi
 }
 
@@ -589,6 +616,8 @@ while true; do
 
   if ult_ready; then
     do_attack ultimate
+  elif scroll=$(scroll_to_use); then
+    do_use_scroll "$scroll"
   elif box=$(box_to_open); then
     do_open_box "$box"
   elif can_buy; then

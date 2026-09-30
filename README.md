@@ -6,7 +6,7 @@ A small bash bot that plays [ONE MILLION HP](https://onemillionhp.com) for you.
 
 Every API response includes your updated player state (`me`), and the bot picks its next move from it:
 
-1. **Ultimate available** → use it, always. It does damage right away, and your charm's refunds recharge it.
+1. **Ultimate available** → use it, always. (The game removed the ultimate on 2026-09-29, replacing the button with scrolls. If the server refuses an ultimate, the bot stops trying for `OMHP_ULT_BACKOFF` seconds, 600, instead of retrying it on every pass, which had stalled all attacks.)
 2. **Loot box in the bag** → open it. Wooden crates and iron chests are the exception: they're banked unopened until the kill attempt itself (see below).
 3. **Enough shards for an Occult Ossuary** (500 by default) → buy one. The next pass opens it through step 2.
 4. **Attacks left** → attack. If the boss is at 5% HP or less, hoard instead (see [Last-hit hoarding](#last-hit-hoarding)).

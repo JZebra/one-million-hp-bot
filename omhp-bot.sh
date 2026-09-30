@@ -192,11 +192,26 @@ stats() {
 
 attack_body() { jq -nc --arg k "$1" --arg r "$(rid)" '{kind:$k, request_id:$r}'; }
 
+# The game removed the ultimate (2026-09-29): the server stopped accepting it
+# while /api/me could still report one as available, and retrying it on every
+# pass starved normal attacks. After a refused ultimate, don't try again for
+# ULT_BACKOFF seconds.
+ULT_BACKOFF="${OMHP_ULT_BACKOFF:-600}"
+ULT_BLOCKED_UNTIL=0
+
+ult_ready() {
+  (( $(date +%s) >= ULT_BLOCKED_UNTIL )) && [[ $(jq -r '.ultimate_available // false' <<<"$ME") == true ]]
+}
+
 do_attack() { # kind = normal | ultimate
   local kind=$1 res
   if res=$(api POST /api/attack "$(attack_body "$kind")"); then
     on_attack "$kind" "$res"
   else
+    if [[ $kind == ultimate && $(error_code "$res") != NETWORK ]]; then
+      ULT_BLOCKED_UNTIL=$(( $(date +%s) + ULT_BACKOFF ))
+      log "ultimate refused ($(error_code "$res")); not trying it again for ${ULT_BACKOFF}s"
+    fi
     handle_error "attack($kind)" "$res"
   fi
 }
@@ -572,7 +587,7 @@ while true; do
 
   hoard=false; hoarding && hoard=true
 
-  if [[ $(jq -r '.ultimate_available // false' <<<"$ME") == true ]]; then
+  if ult_ready; then
     do_attack ultimate
   elif box=$(box_to_open); then
     do_open_box "$box"

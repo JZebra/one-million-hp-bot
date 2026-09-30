@@ -2,7 +2,9 @@
 # Auto-player for https://onemillionhp.com
 #
 # Loop, driven by the `me` object every API response returns:
-#   1. ultimate available -> use it
+#   1. ultimate ready     -> use it
+#      ultimate recharging -> hold normal attacks (except at the attack cap),
+#                             then spend them all right after the ultimate
 #      scroll owned        -> use it (scrolls replaced the ultimate)
 #   2. loot box in bag    -> open it
 #   3. enough shards      -> buy a box (default: occult ossuary), opened by step 2
@@ -28,6 +30,7 @@ API="${OMHP_API:-https://onemillionhp.com}"
 PAUSE="${OMHP_PAUSE:-0.4}"        # seconds between consecutive actions
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
 BUY_BOX="${OMHP_BUY_BOX-occult_ossuary}" # box to buy with shards; empty disables buying
+ULT_HOLD="${OMHP_ULT_HOLD:-1}"    # 1 = hold attacks while the ultimate recharges, spend them right after
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="${OMHP_LOG_DIR:-$SCRIPT_DIR/logs}"
 
@@ -131,7 +134,10 @@ rid() { uuidgen | tr 'A-Z' 'a-z'; }
 server_now() {
   api GET /api/state | jq -r '.server_time // empty'
 }
-SKEW=$(awk -v s="$(server_now)" -v l="$(date +%s)" 'BEGIN{ if (s=="") print 0; else printf "%.3f", s-l }')
+# (sub-second local time: `date +%s` truncates, which made the server look up
+# to 1s ahead and the ultimate get fired early)
+SKEW=$(jq -rn --arg s "$(server_now)" 'if ($s | length) > 0 then ($s | tonumber) - now | . * 1000 | round / 1000 else 0 end' 2>/dev/null)
+[[ $SKEW =~ ^-?[0-9.]+$ ]] || SKEW=0
 
 # Item names/rarities and box tiers, for labelling loot in the log and summary.
 CONTENT=$(api GET /api/content | jq -c '{
@@ -172,6 +178,7 @@ handle_error() {
 # off after an error and the pass falls through to a normal attack, so a game
 # change can cost at most one attempt per backoff, never all our attacks.
 ACTION_BLOCKED="" # "name:until ..."
+SPAM=false        # true right after an ultimate: spend every held attack
 LAST_ERROR=""     # error code of the last failed request
 
 action_ok() { # NAME
@@ -205,13 +212,30 @@ stats() {
 
 attack_body() { jq -nc --arg k "$1" --arg r "$(rid)" '{kind:$k, request_id:$r}'; }
 
-# The game removed the ultimate (2026-09-29): the server stopped accepting it
-# while /api/me could still report one as available, and retrying it on every
-# pass starved normal attacks. After a refused ultimate, don't try again for
-# ULT_BACKOFF seconds.
+# The ultimate recharges on a timer (me.ultimate_ready_at, every
+# me.ult_recharge = 60s, restarting when it's used), and a normal attack can
+# refund a spent one. A refused ultimate is retried after a backoff that starts
+# at 5s (a timing refusal) and doubles up to ULT_BACKOFF on repeated refusals
+# (the game once removed the ultimate outright while still reporting it ready).
 ULT_BACKOFF="${OMHP_ULT_BACKOFF:-600}"
+ULT_FAILS=0
 
-ult_ready() { [[ $(jq -r '.ultimate_available // false' <<<"$ME" 2>/dev/null) == true ]]; }
+# ult_wait: seconds until the ultimate is ready (server clock), or nothing if
+# the server doesn't report a timer.
+ult_wait() {
+  jq -r --argjson skew "$SKEW" 'if (.ultimate_ready_at | type) == "number"
+    then (.ultimate_ready_at - (now + $skew) | . * 100 | round / 100) else empty end' <<<"$ME" 2>/dev/null
+}
+
+ult_ready() {
+  local w; w=$(ult_wait)
+  if [[ -n $w ]]; then awk -v w="$w" 'BEGIN { exit !(w <= 0) }'
+  else [[ $(jq -r '.ultimate_available // false' <<<"$ME" 2>/dev/null) == true ]]; fi
+}
+
+ult_backoff() { # seconds to wait after the Nth refusal in a row
+  awk -v n="$ULT_FAILS" -v max="$ULT_BACKOFF" 'BEGIN { s = 5 * 2 ^ (n - 1); print (s > max ? max : s) }'
+}
 
 do_attack() { # kind = normal | ultimate; returns 1 if the server refused it
   local kind=$1 res
@@ -369,8 +393,9 @@ while true; do
   # Optional actions first. Each one that errors is disabled for a while
   # and the pass carries on, so the normal attack below always gets its turn.
   if action_ok ult && ult_ready; then
-    if do_attack ultimate; then nap "$PAUSE"; continue; fi
-    block_action ult "$ULT_BACKOFF" "ultimate refused"
+    if do_attack ultimate; then ULT_FAILS=0 SPAM=true; nap "$PAUSE"; continue; fi
+    ULT_FAILS=$((ULT_FAILS + 1))
+    block_action ult "$(ult_backoff)" "ultimate refused, $ULT_FAILS in a row"
   fi
   if action_ok scroll && scroll=$(scroll_to_use); then
     if do_use_scroll "$scroll"; then nap "$PAUSE"; continue; fi
@@ -384,20 +409,46 @@ while true; do
     block_action buy 300 "buying $BUY_BOX"
   fi
 
+  left=$(me_num attacks_left -1)
+  uwait=$(ult_wait)
+
+  # Ultimate cycle: a refund proc restarts the 60s timer, so a refund right
+  # after an ultimate is worth a whole extra one, while one late in the cycle
+  # only moves it up a few seconds. So hold normal attacks while the ultimate
+  # recharges and spend them all right after it. Never hold at the attack cap
+  # (recharge would be wasted), and only while the ultimate is working.
+  if [[ $ULT_HOLD == 1 && $SPAM == false && -n $uwait ]] && action_ok ult \
+     && (( left < $(me_num attacks_per_day 20) )); then
+    if [[ ${HOLD_LOGGED:-} != "$(jq -r '.ultimate_ready_at' <<<"$ME")" ]]; then
+      log "holding attacks for the ultimate (ready in ${uwait}s, $left held)"
+      HOLD_LOGGED=$(jq -r '.ultimate_ready_at' <<<"$ME")
+    fi
+    # Sleep to whichever comes first: the ultimate, or the next attack.
+    wait=$(jq -rn --argjson u "$uwait" --argjson a "$(jq -r --argjson skew "$SKEW" \
+      'if (.next_attack_at | type) == "number" then .next_attack_at - (now + $skew) else 5 end' <<<"$ME" 2>/dev/null || echo 5)" \
+      '[$u + 0.3, $a + 0.3] | min | if . < 0.2 then 0.2 elif . > 60 then 60 else . end' 2>/dev/null)
+    nap "${wait:-1}"
+    refresh || nap 5
+    continue
+  fi
+
   # The default: a normal attack. If attacks_left is missing or renamed,
   # try anyway and let the server say NO_ATTACKS.
-  left=$(me_num attacks_left -1)
   if (( left != 0 )); then
     # Out of attacks (the server says so even when attacks_left is missing):
     # wait a recharge interval rather than asking again every second.
-    do_attack normal || { [[ $LAST_ERROR == NO_ATTACKS ]] && nap "$(me_num recharge_seconds 5)" || nap 1; }
+    do_attack normal || { [[ $LAST_ERROR == NO_ATTACKS ]] && { SPAM=false; nap "$(me_num recharge_seconds 5)"; } || nap 1; }
   else
+    SPAM=false # all attacks spent
     # Nothing to do: sleep until the next attack recharges (next_attack_at,
-    # or the recharge interval if that field is missing).
-    wait=$(jq -r --arg skew "$SKEW" --arg now "$(date +%s)" '
-      if (.next_attack_at | type) == "number"
-      then ((.next_attack_at - ($now|tonumber) - ($skew|tonumber) + 0.5) | if . < 1 then 1 elif . > 60 then 60 else . end)
-      else (.recharge_seconds // 5) end' <<<"$ME" 2>/dev/null)
+    # or the recharge interval if that field is missing), or until the
+    # ultimate is ready if that comes first.
+    wait=$(jq -r --arg skew "$SKEW" --arg now "$(date +%s)" --arg u "${uwait:-}" '
+      (if (.next_attack_at | type) == "number"
+       then (.next_attack_at - ($now|tonumber) - ($skew|tonumber) + 0.5)
+       else (.recharge_seconds // 5) end) as $a
+      | (if $u != "" then [$a, ($u | tonumber) + 0.3] | min else $a end)
+      | if . < 0.2 then 0.2 elif . > 60 then 60 else . end' <<<"$ME" 2>/dev/null)
     nap "${wait:-5}"
     refresh || nap 5
     continue

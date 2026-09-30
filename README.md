@@ -6,7 +6,7 @@ A small bash bot that plays [ONE MILLION HP](https://onemillionhp.com) for you.
 
 Every API response includes your updated player state (`me`), and the bot picks its next move from it:
 
-1. **Ultimate available** → use it, always. (The game removed the ultimate on 2026-09-29, replacing the button with scrolls. If the server refuses an ultimate, the bot stops trying for `OMHP_ULT_BACKOFF` seconds, 600, instead of retrying it on every pass, which had stalled all attacks.)
+1. **Ultimate ready** → use it. While it recharges, normal attacks are held and then all spent right after the next ultimate (see [The ultimate cycle](#the-ultimate-cycle)).
 2. **Scroll owned** → use it right away. Scrolls replaced the ultimate and drop from attacks (freezing, poison, treasure, attack steal, boss heal). If the server refuses one (boss heal only works at 89% boss HP or lower), that scroll is set aside for 2 minutes instead of being retried every pass. Scrolls used are listed in the session summary.
 3. **Loot box in the bag** → open it.
 4. **Enough shards for an Occult Ossuary** (500 by default) → buy one. The next pass opens it through step 3.
@@ -15,6 +15,25 @@ Every API response includes your updated player state (`me`), and the bot picks 
 7. **Boss not alive** → check again every 30s until the next boss spawns.
 
 Attacks recharge one every 5s, up to 20 stored.
+
+### The ultimate cycle
+
+The ultimate recharges on a 60-second timer (`me.ultimate_ready_at`, `me.ult_recharge`), and each normal attack has a chance to refund a spent one (1.5% with LAST SAVE POINT). Your logs show the timer **restarts when the ultimate is used**: after a refunded ultimate, the next timed one came 55–65s later. So when a refund happens matters:
+
+- A refund 55s into the cycle only moves the next ultimate up by ~5s.
+- A refund 1s in is worth a whole extra ultimate.
+
+The bot therefore holds normal attacks while the ultimate recharges, fires the ultimate the moment it's ready, then spends every held attack right away. A refund during that spend fires the next ultimate immediately and restarts the cycle. Holding never goes past the attack cap (20), so no recharge is wasted, and the bot wakes exactly when the ultimate or the next attack is due instead of up to 5s late.
+
+| Strategy (model, 1.5% refund, ~1,000-damage ultimates) | Ultimates/h | Damage |
+| --- | --- | --- |
+| Attack as they recharge, ultimate noticed ~4s late (before) | 62.2 | baseline |
+| Same, waking exactly when the ultimate is ready | 65.0 | +3.5% |
+| **Hold until the ultimate, then spend everything** | **70.1** | **+9.9%** |
+
+Against a mock server with the same mechanics sped up 5× (12s timer, 10% refunds), holding got 12/9/9 ultimates per minute against 9/8/8 without, with identical refund luck. Set `OMHP_ULT_HOLD=0` to attack as attacks recharge instead.
+
+If the server refuses an ultimate, the bot retries after 5s, doubling on each refusal in a row up to `OMHP_ULT_BACKOFF` (600s). While the ultimate is backed off, attacks aren't held.
 
 ### Regenerated ultimates and attacks
 
@@ -96,6 +115,8 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_PAUSE`      | `0.4`                       | Seconds between consecutive actions        |
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
 | `OMHP_BUY_BOX`    | `occult_ossuary`            | Box to buy with shards; empty disables buying |
+| `OMHP_ULT_HOLD`   | `1`                         | Hold attacks while the ultimate recharges, spend them right after it; `0` attacks as they recharge |
+| `OMHP_ULT_BACKOFF`| `600`                       | Longest wait after repeated ultimate refusals (starts at 5s) |
 | `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |
 
 ## Example output (illustrative)

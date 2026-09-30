@@ -227,14 +227,25 @@ These are the endpoints the game's own web client uses, found by reading `js/api
 
 All authenticated calls send `Authorization: Bearer <token>`. The `request_id` makes a retry safe: if you resend the same ID, the server returns the original result instead of acting twice.
 
-## Error handling
+## Error handling and game changes
+
+The game changes often (the ultimate was removed mid-boss, fields get added and renamed). The bot is built so that whatever breaks, it falls back to **normal attacks**:
+
+- **Optional actions back off.** The ultimate, scrolls, box opening, buying and the hoarding logic are all optional. If one errors, it's disabled for a while (ultimate 10 min, buying 5 min, boxes 2 min, hoarding 1 min, each refused scroll 2 min), and the same pass carries on to a normal attack. A broken feature costs one attempt per backoff, never all your attacks. Optional actions don't wait after an error.
+- **Missing or renamed fields default to attacking.** If `attacks_left` is missing, the bot attacks anyway and lets the server answer `NO_ATTACKS`. It then waits one recharge interval (`recharge_seconds`, or 5s) before trying again. If `next_attack_at` is missing, it waits the recharge interval. A response without `me` triggers a fresh `/api/me`.
+- **Non-JSON responses** (proxy error pages, moved endpoints) are turned into an error with the HTTP status, so the bot never tries to parse HTML.
+- **No tight loops.** Every failure path waits at least a moment.
 
 | Error                          | Behavior                    |
 | ------------------------------ | --------------------------- |
 | `UNAUTHENTICATED` / 401        | Exit (bad token)            |
 | `NEED_NAME`                    | Exit (set a name in the web UI) |
-| Network error, 429, 5xx        | Wait 5s, refresh, continue  |
-| Anything else (e.g. `NO_ATTACKS`, `ULTIMATE_USED`) | Refresh state, continue |
+| Optional action fails          | Disable it for a while; attack normally this pass |
+| `NO_ATTACKS`                   | Wait one recharge interval  |
+| Network error, 429, 5xx (normal attack) | Wait 3s, refresh, continue |
+| Anything else                  | Refresh state, wait 1s, continue |
+
+Tested against a server with renamed fields, a refused ultimate, HTML errors from scrolls, boxes and random attacks, a closed shop, and a broken mod value: each broken action was tried once and disabled within the first second, and the bot kept attacking.
 
 ## Notes
 

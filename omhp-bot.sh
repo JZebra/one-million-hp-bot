@@ -139,7 +139,14 @@ api() {
   [[ -n $body ]] && args+=(-H "Content-Type: application/json" -d "$body")
   out=$(curl "${args[@]}" "$API$path") || { echo '{"error":{"code":"NETWORK"}}'; return 1; }
   code=${out##*$'\n'}
-  printf '%s' "${out%$'\n'*}"
+  out=${out%$'\n'*}
+  # A non-JSON body (proxy error page, changed endpoint) becomes a JSON error
+  # carrying the HTTP status, so callers can always parse what they get.
+  if ! jq -e . <<<"$out" >/dev/null 2>&1; then
+    printf '{"error":{"code":"HTTP_%s","message":"non-JSON response"}}' "$code"
+    return 1
+  fi
+  printf '%s' "$out"
   [[ $code == 2* ]]
 }
 
@@ -172,18 +179,50 @@ refresh() {
   BOSS=$(api GET /api/state | jq -c '.boss // {}')
 }
 
-error_code() { jq -r '.error.code // "UNKNOWN"' <<<"$1"; }
+error_code() { jq -r '.error.code // "UNKNOWN"' <<<"$1" 2>/dev/null || echo UNKNOWN; }
 
+# handle_error WHAT RESPONSE [optional]: optional actions never wait here, so
+# the pass moves straight on to a normal attack.
 handle_error() {
-  local what=$1 res=$2 code
+  local what=$1 res=$2 optional=${3:-} code
   code=$(error_code "$res")
-  log "$what failed: $code $(jq -r '.error.message // empty' <<<"$res")"
+  LAST_ERROR=$code
+  log "$what failed: $code $(jq -r '.error.message // empty' <<<"$res" 2>/dev/null)"
   case $code in
     NEED_NAME) log "Pick a name in the web UI first."; exit 1 ;;
     HTTP_401|UNAUTHORIZED|UNAUTHENTICATED) log "Token rejected."; exit 1 ;;
-    NETWORK|HTTP_429|HTTP_5*) nap 5 ;;
+    NETWORK|HTTP_429|HTTP_5*) [[ -n $optional ]] || nap 3 ;;
   esac
-  refresh || nap 5
+  refresh || [[ -n $optional ]] || nap 3
+}
+
+# ---- resilience: optional actions (ultimate, scroll, box, buy, hoard) back
+# off after an error and the pass falls through to a normal attack, so a game
+# change can cost at most one attempt per backoff, never all our attacks.
+ACTION_BLOCKED="" # "name:until ..."
+LAST_ERROR=""     # error code of the last failed request
+
+action_ok() { # NAME
+  local until
+  until=$(printf '%s\n' $ACTION_BLOCKED | awk -F: -v n="$1" '$1 == n { u = $2 } END { print u + 0 }')
+  (( $(date +%s) >= until ))
+}
+
+block_action() { # NAME SECONDS [REASON]
+  ACTION_BLOCKED="$(printf '%s\n' $ACTION_BLOCKED | awk -F: -v n="$1" '$1 != n' | tr '\n' ' ')$1:$(( $(date +%s) + $2 ))"
+  log "$1 disabled for ${2}s after an error${3:+ ($3)}; attacking normally meanwhile"
+}
+
+# take_me JSON: adopt a response's `me` if it has one, otherwise re-fetch
+take_me() {
+  local m
+  m=$(jq -c '.me // empty | select(type == "object")' <<<"$1" 2>/dev/null)
+  if [[ -n $m ]]; then ME=$m; else refresh; fi
+}
+
+# A number from ME, or DEFAULT if the field is missing or not a number.
+me_num() { # FIELD DEFAULT
+  jq -r --arg f "$1" --arg d "$2" '.[$f] | if type == "number" then . else $d end' <<<"$ME" 2>/dev/null || echo "$2"
 }
 
 stats() {
@@ -199,30 +238,25 @@ attack_body() { jq -nc --arg k "$1" --arg r "$(rid)" '{kind:$k, request_id:$r}';
 # pass starved normal attacks. After a refused ultimate, don't try again for
 # ULT_BACKOFF seconds.
 ULT_BACKOFF="${OMHP_ULT_BACKOFF:-600}"
-ULT_BLOCKED_UNTIL=0
 
-ult_ready() {
-  (( $(date +%s) >= ULT_BLOCKED_UNTIL )) && [[ $(jq -r '.ultimate_available // false' <<<"$ME") == true ]]
-}
+ult_ready() { [[ $(jq -r '.ultimate_available // false' <<<"$ME" 2>/dev/null) == true ]]; }
 
-do_attack() { # kind = normal | ultimate
+do_attack() { # kind = normal | ultimate; returns 1 if the server refused it
   local kind=$1 res
   if res=$(api POST /api/attack "$(attack_body "$kind")"); then
     on_attack "$kind" "$res"
   else
-    if [[ $kind == ultimate && $(error_code "$res") != NETWORK ]]; then
-      ULT_BLOCKED_UNTIL=$(( $(date +%s) + ULT_BACKOFF ))
-      log "ultimate refused ($(error_code "$res")); not trying it again for ${ULT_BACKOFF}s"
-    fi
-    handle_error "attack($kind)" "$res"
+    handle_error "attack($kind)" "$res" $([[ $kind == ultimate ]] && echo optional)
+    return 1
   fi
 }
 
 # on_attack KIND RESPONSE [quiet]: take the new state, log and record the hit
 on_attack() {
   local kind=$1 res=$2 quiet=${3:-}
-  ME=$(jq -c '.me' <<<"$res")
-  BOSS=$(jq -c '.boss // {}' <<<"$res")
+  take_me "$res"
+  local b; b=$(jq -c '.boss // empty | select(type == "object")' <<<"$res" 2>/dev/null)
+  [[ -n $b ]] && BOSS=$b
   record "$(jq -c --arg k "$kind" '.attack as $a | {t: "attack", kind: $k, damage: ($a.damage // 0),
     crit: ($a.crit // false), item_id: $a.item_id, procs: ($a.procs // {}), boss_seq: .boss.seq, boss_hp: .boss.hp}' <<<"$res")"
   jq -r --arg k "$kind" '.attack as $a | "\($k | ascii_upcase): \($a.damage) dmg" +
@@ -238,7 +272,7 @@ open_body() { jq -nc --arg b "$1" --arg r "$(rid)" '{box_id:$b, request_id:$r}';
 
 # on_box_open BOX RESPONSE: take the new state and record what was inside
 on_box_open() {
-  ME=$(jq -c '.me' <<<"$2")
+  take_me "$2"
   record "$(jq -c --arg b "$1" --argjson ct "$CONTENT" '.result as $r | ($ct.items // {})[$r.item_id // ""] as $i |
     {t: "box", box_id: $b, result: ($r + {item_name: $i.name, rarity: ($r.rarity // $i.rarity)})}' <<<"$2")"
 }
@@ -249,7 +283,8 @@ do_open_box() {
     on_box_open "$box" "$res"
     log "OPENED $box -> $(jq -c '.result' <<<"$res")"
   else
-    handle_error "open($box)" "$res"
+    handle_error "open($box)" "$res" optional
+    return 1
   fi
 }
 
@@ -266,15 +301,15 @@ scroll_to_use() {
 do_use_scroll() {
   local id=$1 res
   if res=$(api POST /api/scrolls/use "$(jq -nc --arg s "$id" '{scroll_id: $s}')"); then
-    ME=$(jq -c '.me // empty' <<<"$res"); [[ -n $ME ]] || refresh
-    local b; b=$(jq -c '.boss // empty' <<<"$res"); [[ -n $b ]] && BOSS=$b
+    take_me "$res"
+    local b; b=$(jq -c '.boss // empty | select(type == "object")' <<<"$res" 2>/dev/null); [[ -n $b ]] && BOSS=$b
     record "$(jq -c --arg s "$id" '{t: "scroll", scroll_id: $s, amount: .amount, shards: .shards}' <<<"$res")"
     log "SCROLL: used $id$(jq -r 'if .amount then " (amount \(.amount))" else "" end + if .shards then " +\(.shards) shards" else "" end' <<<"$res")"
   else
     SCROLL_BLOCKED="$SCROLL_BLOCKED $id:$(( $(date +%s) + 120 ))"
     log "scroll $id refused ($(error_code "$res")): $(jq -r '.error.message // empty' <<<"$res"); retrying in 120s"
-    [[ $(error_code "$res") == NETWORK ]] && nap 5
-    refresh || nap 5
+    refresh
+    return 1
   fi
 }
 
@@ -299,13 +334,14 @@ do_buy_box() {
   shards=$(jq -r '.shards // 0' <<<"$ME")
   price=$(box_price)
   if res=$(api POST /api/shop/buy "$(jq -nc --arg b "$BUY_BOX" '{box_id:$b}')"); then
-    ME=$(jq -c '.me' <<<"$res")
+    take_me "$res"
     BUY_BLOCKED_AT=""
     record "$(jq -nc --arg b "$BUY_BOX" --argjson p "$price" '{t: "buy", box_id: $b, price: $p}')"
     log "BOUGHT $BUY_BOX for $price shards  ($(jq -r '.shards // 0' <<<"$ME") left)"
   else
     BUY_BLOCKED_AT=$shards
-    handle_error "buy($BUY_BOX)" "$res"
+    handle_error "buy($BUY_BOX)" "$res" optional
+    return 1
   fi
 }
 
@@ -498,9 +534,9 @@ hoard_step() {
     rate=$RATE
   fi
   hp=$(jq -r '.hp' <<<"$BOSS")
-  left=$(jq -r '.attacks_left // 0' <<<"$ME")
-  per=$(jq -r '.attacks_per_day // 20' <<<"$ME")
-  crits=$(jq -r '.next_crits // 0' <<<"$ME")
+  left=$(me_num attacks_left 0)
+  per=$(me_num attacks_per_day 20)
+  crits=$(me_num next_crits 0)
   read -r banked bankest bankvar bankatk <<<"$(bank_estimate)"
   update_estimates
 
@@ -542,6 +578,10 @@ hoard_step() {
       elif $left >= $per and $crits == 0 then "spend"
       else "wait \($cap)" end')
 
+  if [[ ! $plan =~ ^(fire|timed|spend|wait) ]]; then
+    log "hoarding plan failed (got: ${plan:-nothing})"
+    return 1
+  fi
   case $plan in
     fire*) burst "${plan#fire }"; PREV_HP="" ME_AT=$(now_f) ;;
     timed*)
@@ -614,24 +654,43 @@ while true; do
 
   hoard=false; hoarding && hoard=true
 
-  if ult_ready; then
-    do_attack ultimate
-  elif scroll=$(scroll_to_use); then
-    do_use_scroll "$scroll"
-  elif box=$(box_to_open); then
-    do_open_box "$box"
-  elif can_buy; then
-    do_buy_box
-  elif [[ $hoard == true ]]; then
-    hoard_step
-    continue
-  elif (( $(jq -r '.attacks_left // 0' <<<"$ME") > 0 )); then
-    do_attack normal
+  # Optional actions first. Each one that errors is disabled for a while
+  # and the pass carries on, so the normal attack below always gets its turn.
+  if action_ok ult && ult_ready; then
+    if do_attack ultimate; then nap "$PAUSE"; continue; fi
+    block_action ult "$ULT_BACKOFF" "ultimate refused"
+  fi
+  if action_ok scroll && scroll=$(scroll_to_use); then
+    if do_use_scroll "$scroll"; then nap "$PAUSE"; continue; fi
+  fi
+  if action_ok box && box=$(box_to_open); then
+    if do_open_box "$box"; then nap "$PAUSE"; continue; fi
+    block_action box 120 "opening $box"
+  fi
+  if action_ok buy && can_buy; then
+    if do_buy_box; then nap "$PAUSE"; continue; fi
+    block_action buy 300 "buying $BUY_BOX"
+  fi
+  if [[ $hoard == true ]] && action_ok hoard; then
+    hoard_step && continue
+    block_action hoard 60 "hoarding logic"
+  fi
+
+  # The default: a normal attack. If attacks_left is missing or renamed,
+  # try anyway and let the server say NO_ATTACKS.
+  left=$(me_num attacks_left -1)
+  if (( left != 0 )); then
+    # Out of attacks (the server says so even when attacks_left is missing):
+    # wait a recharge interval rather than asking again every second.
+    do_attack normal || { [[ $LAST_ERROR == NO_ATTACKS ]] && nap "$(me_num recharge_seconds 5)" || nap 1; }
   else
-    # Nothing to do: sleep until the next attack recharges.
-    wait=$(jq -r --arg skew "$SKEW" --arg now "$(date +%s)" \
-      '((.next_attack_at // 0) - ($now|tonumber) - ($skew|tonumber) + 0.5) | if . < 1 then 1 else . end' <<<"$ME")
-    nap "$wait"
+    # Nothing to do: sleep until the next attack recharges (next_attack_at,
+    # or the recharge interval if that field is missing).
+    wait=$(jq -r --arg skew "$SKEW" --arg now "$(date +%s)" '
+      if (.next_attack_at | type) == "number"
+      then ((.next_attack_at - ($now|tonumber) - ($skew|tonumber) + 0.5) | if . < 1 then 1 elif . > 60 then 60 else . end)
+      else (.recharge_seconds // 5) end' <<<"$ME" 2>/dev/null)
+    nap "${wait:-5}"
     refresh || nap 5
     continue
   fi

@@ -6,25 +6,10 @@
 #      scroll owned        -> use it (scrolls replaced the ultimate)
 #   2. loot box in bag    -> open it
 #   3. enough shards      -> buy a box (default: occult ossuary), opened by step 2
+# Every optional step (ultimate, scroll, box, buy) that errors is disabled for
+# a while and the pass falls through to a normal attack.
 #   4. attacks left       -> attack
 #   else sleep until the next attack recharges (or poll while the boss is dead)
-#
-# Live feed: omhp-live.mjs (Node 22+) follows the game's WebSocket stream and
-# keeps the boss HP, the other players' damage rate and the stream lag in a
-# file, which hoarding reads every OMHP_LIVE_POLL seconds. Without Node, or if
-# the feed drops, hoarding falls back to polling /api/state.
-#
-# Last-hit hoarding: once the boss is at or below OMHP_HOARD_PCT of its HP,
-# attacks are held back (the ultimate is still used right away). Banked loot
-# boxes (OMHP_BANK_BOXES: wooden crates and iron chests) stay unopened until
-# the kill attempt itself: the game spends crit charges on the very next
-# attacks, so charges must not exist before the burst. The bot watches the
-# boss HP; when a burst (with the charges the bank will likely produce) can
-# finish the boss, it fires one burst that weaves box opens with attacks
-# (open, attack, open, attack...), so each charge is created just before the
-# attacks that use it. Opens and attacks are separate endpoints with their
-# own rate limits, so weaving costs no extra time. At the attack cap it spends
-# one at a time so recharge isn't wasted, unless that would burn a crit charge.
 #
 # Every action is appended to logs/session-*.jsonl; stopping the bot (Ctrl-C,
 # SIGTERM) prints a summary built from that file.
@@ -43,16 +28,6 @@ API="${OMHP_API:-https://onemillionhp.com}"
 PAUSE="${OMHP_PAUSE:-0.4}"        # seconds between consecutive actions
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
 BUY_BOX="${OMHP_BUY_BOX-occult_ossuary}" # box to buy with shards; empty disables buying
-HOARD_PCT="${OMHP_HOARD_PCT:-5}"      # start hoarding at this % boss HP; 0 disables
-BANK_BOXES="${OMHP_BANK_BOXES-wooden_crate,iron_chest}" # boxes kept unopened until hoarding
-BANK_MAX="${OMHP_BANK_MAX:-50}"       # open banked boxes beyond this many
-HOARD_POLL="${OMHP_HOARD_POLL:-1}"    # seconds between boss HP checks while hoarding
-HIT_EST_DEFAULT="${OMHP_HIT_EST:-20}" # per-hit damage guess until the logs have data
-MARGIN_SD="${OMHP_MARGIN_SD:-1.5}"    # fire when HP <= burst mean - this many sd (1.5 = ~93% sure)
-                                      # 1.5 suits the 50-box bank; with a 30-box bank, 0.5 did best
-LIVE="${OMHP_LIVE:-1}"                # 1 = use the WebSocket feed when Node 22+ is available
-LIVE_POLL="${OMHP_LIVE_POLL:-0.2}"    # seconds between live-feed reads while hoarding
-FIRE_LEAD="${OMHP_FIRE_LEAD:-0.3}"    # seconds for our attacks to reach the server
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="${OMHP_LOG_DIR:-$SCRIPT_DIR/logs}"
 
@@ -163,10 +138,7 @@ CONTENT=$(api GET /api/content | jq -c '{
   items: ([.items[]? | {key: .id, value: {name, rarity}}] | from_entries),
   box_names: ([.boxes[]? | {key: .id, value: .name}] | from_entries),
   box_rank: ([.boxes // [] | to_entries[] | {key: .value.id, value: .key}] | from_entries),
-  rarity_rank: ([.rarities[]? | {key: .id, value: .rank}] | from_entries),
-  box_crit: ([.boxes[]? | {key: .id, value: ([.odds[]? | select(.kind == "next_crit")]
-    | {mean: (map(.chance * (.amount // 1)) | add // 0), m2: (map(.chance * (.amount // 1) * (.amount // 1)) | add // 0)})}] | from_entries),
-  box_atk: ([.boxes[]? | {key: .id, value: ([.odds[]? | select(.kind == "attacks") | .chance * (.amount // 1)] | add // 0)}] | from_entries)
+  rarity_rank: ([.rarities[]? | {key: .id, value: .rank}] | from_entries)
 }' 2>/dev/null) || CONTENT='{}'
 [[ -n $CONTENT ]] || CONTENT='{}'
 
@@ -196,7 +168,7 @@ handle_error() {
   refresh || [[ -n $optional ]] || nap 3
 }
 
-# ---- resilience: optional actions (ultimate, scroll, box, buy, hoard) back
+# ---- resilience: optional actions (ultimate, scroll, box, buy) back
 # off after an error and the pass falls through to a normal attack, so a game
 # change can cost at most one attempt per backoff, never all our attacks.
 ACTION_BLOCKED="" # "name:until ..."
@@ -345,265 +317,10 @@ do_buy_box() {
   fi
 }
 
-# ---------------------------------------------------------------- last-hit hoarding
+# box_to_open: the first box in the bag, if any.
+box_to_open() { jq -er '[(.boxes // [])[] | select((.count // 1) > 0) | .box_id][0] // empty' <<<"$ME" 2>/dev/null; }
 
-# Is the boss at or below HOARD_PCT of its max HP?
-hoarding() {
-  jq -e --argjson pct "$HOARD_PCT" '$pct > 0 and .status == "alive" and .hp != null and .max_hp != null
-    and .hp <= .max_hp * $pct / 100' <<<"$BOSS" >/dev/null
-}
-
-# Damage estimates from recent attacks (newest session logs), refreshed at
-# most once a minute: mean and spread of non-crit normal hits and of crits.
-# Only hits while the boss was above 10% HP count: below that, executioner
-# gear boosts damage, and hoard_step applies that bonus itself.
-HIT_MEAN=$HIT_EST_DEFAULT HIT_SD=0 CRIT_MEAN=$((HIT_EST_DEFAULT * 12)) CRIT_SD=0 EST_AT=0
-
-update_estimates() {
-  local now; now=$(date +%s)
-  (( now - EST_AT < 60 )) && return
-  EST_AT=$now
-  local est
-  est=$(ls -1t "$LOG_DIR"/session-*.jsonl 2>/dev/null | head -8 | xargs tail -q -n 20000 2>/dev/null | jq -rs \
-    --argjson d "$HIT_EST_DEFAULT" '
-    [.[] | select(.t == "attack" and .kind == "normal" and (.boss_hp == null or .boss_hp > 100000))] | sort_by(.ts) as $a
-    | ($a | map(select(.crit | not) | .damage) | .[-1000:]) as $h
-    | ($a | map(select(.crit) | .damage) | .[-150:]) as $c
-    | def sd($x; $m): $x | map(. * .) | add / length - $m * $m | if . < 0 then 0 else sqrt end;
-    (if ($h | length) > 20 then ($h | add / length) else $d end) as $m
-    | (if ($h | length) > 20 then sd($h; $m) else 0 end) as $sd
-    | (if ($c | length) > 10 then ($c | add / length) else $m * 12 end) as $cm
-    | (if ($c | length) > 10 then sd($c; $cm) else 0 end) as $csd
-    | "\($m * 10 | round / 10) \($sd * 10 | round / 10) \($cm | round) \($csd | round)"' 2>/dev/null)
-  [[ -n $est ]] && read -r HIT_MEAN HIT_SD CRIT_MEAN CRIT_SD <<<"$est"
-}
-
-# box_to_open: the next box to open, if any. Banked types stay shut (they're
-# woven into the kill burst) unless the bank passes BANK_MAX; everything else
-# opens right away. While hoarding, nothing opens: a box's crit charge would
-# stop the bot from spending at the attack cap (wasting recharge), so every
-# box waits for the burst.
-box_to_open() {
-  hoarding && return 1
-  jq -er --arg bank "$BANK_BOXES" --argjson all false --argjson max "$BANK_MAX" '
-    ($bank | split(",") | map(select(. != ""))) as $bk
-    | (.boxes // []) as $b
-    | ($b | map(select(.box_id as $i | $bk | index($i)))) as $banked
-    | ($banked | map(.count // 1) | add // 0) as $held
-    | ($b | map(select(.box_id as $i | ($bk | index($i) | not))) | .[0].box_id)
-      // (if $all or $held > $max then $banked[0].box_id else empty end)' <<<"$ME"
-}
-
-# bank_estimate: "COUNT CHARGES VAR ATTACKS" for every box in the bag (all of
-# them go into the burst): the crit charges opening them is expected to yield
-# (from the game's box odds) and its variance, and the attacks they add.
-bank_estimate() {
-  jq -r --argjson ct "$CONTENT" '[(.boxes // [])[]] as $b
-    | ($b | map(.count // 1) | add // 0) as $n
-    # Fallback odds (from /api/content at the time of writing) if content failed to load.
-    | {wooden_crate: {mean: 0.185, m2: 0.185}, iron_chest: {mean: 0.375, m2: 0.75}, cursed_casket: {mean: 0.75, m2: 2.25}} as $fb
-    | {wooden_crate: 0.598, iron_chest: 0.7} as $fba
-    | ($b | map((($ct.box_crit // {})[.box_id] // $fb[.box_id] // {mean: 0, m2: 0}) as $o | {n: (.count // 1), mean: $o.mean, var: ($o.m2 - $o.mean * $o.mean)})) as $x
-    | ($x | map(.n * .mean) | add // 0) as $m
-    | ($x | map(.n * .var) | add // 0) as $v
-    | ($b | map((($ct.box_atk // {})[.box_id] // $fba[.box_id] // 0) * (.count // 1)) | add // 0) as $atk
-    | "\($n) \($m * 100 | round / 100) \($v * 100 | round / 100) \($atk | floor)"' <<<"$ME"
-}
-
-# burst N: fire N attacks at once, woven with opening every box in the bag
-# (open, attack, open, attack...): each crit charge lands just before the
-# attacks that use it. Attack requests beyond what we end up having are
-# rejected with NO_ATTACKS.
-burst() {
-  local n=$1 dir i=0 j kind f id ids pids=() t0
-  t0=$(now_f)
-  ids=($(jq -r '(.boxes // [])[] | .box_id as $id | range(.count // 1) | $id' <<<"$ME"))
-  dir=$(mktemp -d)
-  log "BURST: $n attack(s) woven with ${#ids[@]} banked box(es), $(jq -r '.next_crits // 0' <<<"$ME") crit charge(s) at $(jq -r '.hp' <<<"$BOSS") HP"
-  for ((j = 0; j < n || j < ${#ids[@]}; j++)); do
-    if (( j < ${#ids[@]} )); then
-      id=${ids[$j]}
-      { api POST /api/boxes/open "$(open_body "$id")" >"$dir/box.$id.$j" || mv "$dir/box.$id.$j" "$dir/boxerr.$id.$j"; } &
-      pids+=($!)
-    fi
-    if (( j < n )); then
-      { api POST /api/attack "$(attack_body normal)" >"$dir/atk.$j" || mv "$dir/atk.$j" "$dir/atkerr.$j"; } &
-      pids+=($!)
-    fi
-  done
-  (( ${#pids[@]} )) && wait "${pids[@]}"
-  local burst_s; burst_s=$(awk -v a="$t0" -v b="$(now_f)" 'BEGIN{printf "%.2f", b-a}')
-
-  # Box results in one jq pass (fast; the boss may die any moment).
-  if compgen -G "$dir/box.*" >/dev/null; then
-    (cd "$dir" && for f in box.*; do id=${f#box.}; jq -c --arg b "${id%.*}" '{b: $b, r: .result}' "$f"; done) |
-      jq -c --argjson ct "$CONTENT" --argjson ts "$(date +%s)" '.r as $r | ($ct.items // {})[$r.item_id // ""] as $i |
-        {t: "box", box_id: .b, result: ($r + {item_name: $i.name, rarity: ($r.rarity // $i.rarity)}), ts: $ts}' >>"$SESSION_LOG"
-  fi
-  local opened crits_made boxerr
-  opened=$(ls "$dir" | grep -c '^box\.')
-  boxerr=$(ls "$dir" | grep -c '^boxerr\.')
-  crits_made=$( (cd "$dir" && cat box.* 2>/dev/null) | jq -s '[.[] | .result | select(.kind == "next_crit") | .amount // 1] | add // 0')
-
-  local failed=() hits=0 crit_hits=0
-  for f in "$dir"/atk.*; do
-    [[ -e $f ]] || continue
-    on_attack normal "$(cat "$f")" quiet
-    hits=$((hits + 1))
-    [[ $(jq -r '.attack.crit // false' <"$f") == true ]] && crit_hits=$((crit_hits + 1))
-  done
-  for f in "$dir"/atkerr.*; do
-    [[ -e $f ]] && failed+=("$(jq -r '.error.code // "?"' <"$f")")
-  done
-  rm -rf "$dir"
-  log "  burst took ${burst_s}s: $hits hit(s), $crit_hits crit; opened $opened box(es)$( (( boxerr )) && echo " ($boxerr failed)") making $crits_made crit charge(s)"
-  (( ${#failed[@]} )) && log "  ${#failed[@]} attack(s) rejected: $(printf '%s\n' "${failed[@]}" | sort | uniq -c | awk '{printf "%s%s x%s", (NR>1?", ":""), $2, $1}')"
-  refresh || nap 5
-  log "  $(stats)"
-}
-
-# ---- live feed
-
-LIVE_FILE="" LIVE_RATE=0 LIVE_LAG=0 LIVE_GIFTS=0 # LIVE_RATE: steady rate, big hits left out
-
-start_live() {
-  [[ $LIVE == 1 ]] || { log "Live feed: off (OMHP_LIVE=$LIVE)"; return; }
-  if ! command -v node >/dev/null || ! node -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)' 2>/dev/null; then
-    log "Live feed: off (needs Node 22+); hoarding will poll the API every ${HOARD_POLL}s"
-    return
-  fi
-  LIVE_FILE="$LOG_DIR/.live-$$.json"
-  OMHP_API=$API OMHP_TOKEN=$TOKEN OMHP_SKEW=$SKEW OMHP_PARENT_PID=$$ \
-    OMHP_PLAYER_ID=$(jq -r '.id // ""' <<<"$ME") \
-    node "$SCRIPT_DIR/omhp-live.mjs" "$LIVE_FILE" 2>>"$LOG_DIR/live.err" &
-  log "Live feed: on (WebSocket)"
-}
-
-# live_read: load boss/rate/lag from the feed if the helper is up and connected
-live_read() {
-  [[ -n $LIVE_FILE && -s $LIVE_FILE ]] || return 1
-  local j
-  j=$(jq -c 'select(.connected and (now - .written) < 3 and .boss != null)' "$LIVE_FILE" 2>/dev/null)
-  [[ -n $j ]] || return 1
-  BOSS=$(jq -c '.boss' <<<"$j")
-  read -r LIVE_RATE LIVE_LAG LIVE_GIFTS < <(jq -r '"\(.steady // .rate // 0) \(.lag // 0) \(.gifts // 0)"' <<<"$j")
-}
-
-# ---- hoarding
-
-LAST_HOARD_KEY="" LAST_HOARD_LOG=0
-PREV_HP="" PREV_T="" RATE=0 RATES=""  # polling mode: HP drop rate (HP/s), median of the last 5 samples
-ME_AT=0 SEEN_GIFTS=0           # live mode: when /api/me was last fetched, gifts seen
-
-now_f() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
-
-track_rate() { # track_rate HP
-  local now x
-  now=$(now_f)
-  if [[ -n $PREV_HP ]]; then
-    x=$(awk -v a="$PREV_HP" -v b="$1" -v t0="$PREV_T" -v t1="$now" 'BEGIN{ dt = t1 - t0; if (dt <= 0 || b > a) print ""; else printf "%.1f", (a - b) / dt }')
-    if [[ -n $x ]]; then
-      # A median ignores the occasional ultimate-sized jump (see omhp-live.mjs).
-      RATES=$(printf '%s\n' $RATES "$x" | tail -5 | tr '\n' ' ')
-      RATE=$(printf '%s\n' $RATES | sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] }')
-    fi
-  fi
-  PREV_HP=$1 PREV_T=$now
-}
-
-# In live mode the boss comes from the feed; /api/me is only re-fetched when
-# an attack has recharged, a gift arrived, or 15s have passed.
-refresh_me_if_due() {
-  local due
-  due=$(jq -r --argjson skew "$SKEW" --argjson at "$ME_AT" --argjson g "$LIVE_GIFTS" --argjson sg "$SEEN_GIFTS" '
-    (now - $at > 15) or ($g != $sg) or ((.next_attack_at // 0) > 0 and now + $skew >= .next_attack_at)' <<<"$ME")
-  [[ $due == true ]] || return 0
-  local r
-  r=$(api GET /api/me) && ME=$r
-  ME_AT=$(now_f) SEEN_GIFTS=$LIVE_GIFTS
-}
-
-hoard_step() {
-  local hp left per crits plan rate lag poll mode banked bankest bankvar bankatk
-  if live_read; then
-    mode=live rate=$LIVE_RATE lag=$LIVE_LAG poll=$LIVE_POLL
-    hoarding || return 0 # the feed says the boss died or left range
-  else
-    mode=poll poll=$HOARD_POLL lag=0
-    track_rate "$(jq -r '.hp' <<<"$BOSS")"
-    rate=$RATE
-  fi
-  hp=$(jq -r '.hp' <<<"$BOSS")
-  left=$(me_num attacks_left 0)
-  per=$(me_num attacks_per_day 20)
-  crits=$(me_num next_crits 0)
-  read -r banked bankest bankvar bankatk <<<"$(bank_estimate)"
-  update_estimates
-
-  # What we can deal in one burst ($cap), estimated as one sum: N attacks
-  # (held plus those the bank is expected to add), of which C carry crit
-  # charges (ours plus the bank's expected yield). Mean = C crits + (N - C)
-  # normal hits; the variance adds each hit's spread and the uncertainty in
-  # how many charges the bank gives. $cap = mean - MARGIN_SD standard
-  # deviations. (Counting each crit at a low percentile instead made the
-  # bot wait for HP that other players' ultimates never left us.) The
-  # ultimate isn't counted: it's used as soon as it's ready. Below 10% boss HP
-  # every hit gets the executioner bonus from our gear (me.mods.executioner).
-  # The HP we see is `lag` seconds old and our attacks take FIRE_LEAD to land;
-  # others keep hitting meanwhile. $land = expected HP when the burst arrives.
-  #   fire N      $land is within $cap: fire the woven burst now. N = attacks
-  #               held plus those the bank is expected to add
-  #   timed S N   it will be before the next check: sleep S seconds, then fire
-  #   spend       at the attack cap with no crit charges: use one so recharge
-  #               isn't wasted (with charges, keep them for the burst)
-  #   wait CAP    keep watching
-  plan=$(jq -nr --argjson hp "$hp" --argjson left "$left" --argjson per "$per" --argjson crits "$crits" \
-    --argjson bankest "$bankest" --argjson bankvar "$bankvar" --argjson bankatk "$bankatk" \
-    --argjson mean "$HIT_MEAN" --argjson sd "$HIT_SD" --argjson cmean "$CRIT_MEAN" --argjson csd "$CRIT_SD" \
-    --argjson z "$MARGIN_SD" --argjson rate "$rate" \
-    --argjson exe "$(jq -r --argjson max "$(jq -r '.max_hp // 1000000' <<<"$BOSS")" --argjson hp "$hp" \
-      'if $hp < $max * 0.1 then (.mods.executioner // 0) else 0 end' <<<"$ME")" \
-    --argjson lead "$(awk -v a="$lag" -v b="$FIRE_LEAD" 'BEGIN{print a+b}')" --argjson poll "$poll" '
-    ($mean * (1 + $exe)) as $mean | ($sd * (1 + $exe)) as $sd
-    | ($cmean * (1 + $exe)) as $cmean | ($csd * (1 + $exe)) as $csd
-    | ($left + $bankatk) as $n
-    | ([$crits + $bankest, $n] | min) as $c
-    | ($c * $cmean + ($n - $c) * $mean) as $bm
-    | ($c * $csd * $csd + ($n - $c) * $sd * $sd + $bankvar * ($cmean - $mean) * ($cmean - $mean)) as $bv
-    | ([$bm - $z * ($bv | sqrt), 0] | max | floor) as $cap
-    | ($hp - $rate * $lead) as $land
-    | if $left <= 0 then "wait \($cap)"
-      elif $land <= $cap then "fire \($n)"
-      elif $rate > 0 and ($land - $cap) / $rate < $poll then "timed \(($land - $cap) / $rate * 1000 | floor / 1000) \($n)"
-      elif $left >= $per and $crits == 0 then "spend"
-      else "wait \($cap)" end')
-
-  if [[ ! $plan =~ ^(fire|timed|spend|wait) ]]; then
-    log "hoarding plan failed (got: ${plan:-nothing})"
-    return 1
-  fi
-  case $plan in
-    fire*) burst "${plan#fire }"; PREV_HP="" ME_AT=$(now_f) ;;
-    timed*)
-      set -- ${plan#timed }
-      log "HOARD: boss in reach in ${1}s at -$rate/s; timing the burst"
-      nap "$1"
-      burst "$2"; PREV_HP="" ME_AT=$(now_f) ;;
-    spend)
-      log "HOARD: at the attack cap ($left), spending one so recharge isn't wasted"
-      do_attack normal; PREV_HP="" ME_AT=$(now_f) ;;
-    wait*)
-      # Log when our holdings change, otherwise at most every 5s.
-      local key="$left/$crits/$banked" t
-      t=$(date +%s)
-      if [[ $key != "$LAST_HOARD_KEY" ]] || (( t - LAST_HOARD_LOG >= 5 )); then
-        log "HOARD[$mode]: boss $hp HP (-$rate/s, lag ${lag}s), holding $left attack(s) + $crits crit charge(s) + $banked banked box(es) (~$bankest charges), can hit ~${plan#wait } (hit ${HIT_MEAN}+/-${HIT_SD}, crit ${CRIT_MEAN}+/-${CRIT_SD})"
-        LAST_HOARD_KEY=$key LAST_HOARD_LOG=$t
-      fi
-      nap "$poll"
-      if [[ $mode == live ]]; then refresh_me_if_due; else refresh || nap 5; fi ;;
-  esac
-}
+# ---------------------------------------------------------------- boss kills
 
 # Record each boss defeat once, noting whether we landed the killing blow.
 LAST_DEFEAT_SEQ=""
@@ -612,7 +329,6 @@ note_defeat() {
   seq=$(jq -r '.seq // ""' <<<"$BOSS")
   [[ -z $seq || $seq == "$LAST_DEFEAT_SEQ" ]] && return
   LAST_DEFEAT_SEQ=$seq
-  PREV_HP="" PREV_T="" RATE=0 RATES=""
   killer=$(jq -r '.killer_name // ""' <<<"$BOSS")
   me=$(jq -r '.name // ""' <<<"$ME")
   if [[ -n $killer && $killer == "$me" ]]; then
@@ -627,9 +343,8 @@ note_defeat() {
 
 finish() {
   trap - EXIT INT TERM
-  local j; j=$(jobs -p)       # an interrupted nap's sleep, the live feed helper
+  local j; j=$(jobs -p)       # an interrupted nap's sleep
   [[ -n $j ]] && { kill $j; wait $j; } 2>/dev/null
-  [[ -n $LIVE_FILE ]] && rm -f "$LIVE_FILE" "$LIVE_FILE.tmp"
   record '{"t":"stop"}'
   summarize "$SESSION_LOG"
   echo "Session log: $SESSION_LOG"
@@ -641,7 +356,6 @@ record "$(jq -nc --argjson ct "$CONTENT" '{t: "start", content: $ct}')"
 
 refresh || { log "Could not load player. Check OMHP_TOKEN."; exit 1; }
 log "Playing as $(jq -r '.name // .id' <<<"$ME")  (clock skew ${SKEW}s)"
-start_live
 log "  $(stats)"
 
 while true; do
@@ -651,8 +365,6 @@ while true; do
     log "Boss is $status; checking again in ${DEAD_POLL}s"
     nap "$DEAD_POLL"; refresh; continue
   fi
-
-  hoard=false; hoarding && hoard=true
 
   # Optional actions first. Each one that errors is disabled for a while
   # and the pass carries on, so the normal attack below always gets its turn.
@@ -670,10 +382,6 @@ while true; do
   if action_ok buy && can_buy; then
     if do_buy_box; then nap "$PAUSE"; continue; fi
     block_action buy 300 "buying $BUY_BOX"
-  fi
-  if [[ $hoard == true ]] && action_ok hoard; then
-    hoard_step && continue
-    block_action hoard 60 "hoarding logic"
   fi
 
   # The default: a normal attack. If attacks_left is missing or renamed,

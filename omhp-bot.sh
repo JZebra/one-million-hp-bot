@@ -6,11 +6,12 @@
 #      ultimate recharging -> hold normal attacks (except at the attack cap),
 #                             then spend them all right after the ultimate
 #      scroll owned        -> use it (scrolls replaced the ultimate)
-#   2. loot box in bag    -> open it
-#   3. enough shards      -> buy a box (default: occult ossuary), opened by step 2
-# Every optional step (ultimate, scroll, box, buy) that errors is disabled for
+#   2. enough shards      -> buy a box (default: occult ossuary)
+#      Boxes are never opened: they stay in the bag for you to open by hand.
+# Every optional step (ultimate, scroll, buy) that errors is disabled for
 # a while and the pass falls through to a normal attack.
-#   4. attacks left       -> attack
+#   3. attacks left       -> attack, at most one every OMHP_ATTACK_GAP seconds
+#      (that gap applies to normal attacks only, not the ultimate or the rest)
 #   else sleep until the next attack recharges (or poll while the boss is dead)
 #
 # Every action is appended to logs/session-*.jsonl; stopping the bot (Ctrl-C,
@@ -28,6 +29,7 @@ set -uo pipefail
 
 API="${OMHP_API:-https://onemillionhp.com}"
 PAUSE="${OMHP_PAUSE:-0.4}"        # seconds between consecutive actions
+ATTACK_GAP="${OMHP_ATTACK_GAP:-1.5}" # minimum seconds between normal attacks (not ultimates etc.)
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
 BUY_BOX="${OMHP_BUY_BOX-occult_ossuary}" # box to buy with shards; empty disables buying
 ULT_HOLD="${OMHP_ULT_HOLD:-1}"    # 1 = hold attacks while the ultimate recharges, spend them right after
@@ -174,7 +176,7 @@ handle_error() {
   refresh || [[ -n $optional ]] || nap 3
 }
 
-# ---- resilience: optional actions (ultimate, scroll, box, buy) back
+# ---- resilience: optional actions (ultimate, scroll, buy) back
 # off after an error and the pass falls through to a normal attack, so a game
 # change can cost at most one attempt per backoff, never all our attacks.
 ACTION_BLOCKED="" # "name:until ..."
@@ -237,8 +239,22 @@ ult_backoff() { # seconds to wait after the Nth refusal in a row
   awk -v n="$ULT_FAILS" -v max="$ULT_BACKOFF" 'BEGIN { s = 5 * 2 ^ (n - 1); print (s > max ? max : s) }'
 }
 
+now_f() { perl -MTime::HiRes=time -e 'printf "%.3f", time' 2>/dev/null || date +%s; }
+
+LAST_ATTACK_T=0 # when the last normal attack was sent
+
+# Normal attacks are spaced at least ATTACK_GAP apart, measured send to send.
+# The ultimate, scrolls and purchases don't wait on this and don't reset it.
+attack_gap_wait() {
+  local w
+  w=$(awk -v last="$LAST_ATTACK_T" -v gap="$ATTACK_GAP" -v now="$(now_f)" 'BEGIN { w = last + gap - now; if (w > 0) printf "%.3f", w }')
+  [[ -n $w ]] && nap "$w"
+  LAST_ATTACK_T=$(now_f)
+}
+
 do_attack() { # kind = normal | ultimate; returns 1 if the server refused it
   local kind=$1 res
+  [[ $kind == normal ]] && attack_gap_wait
   if res=$(api POST /api/attack "$(attack_body "$kind")"); then
     on_attack "$kind" "$res"
   else
@@ -262,26 +278,6 @@ on_attack() {
       (($a.procs // {}) | to_entries | map(select(.key != "box_id" and .value)) | map("  [" + .key + "]") | join(""))' <<<"$res" |
     while read -r line; do log "$line"; done
   [[ -n $quiet ]] || log "  $(stats)"
-}
-
-open_body() { jq -nc --arg b "$1" --arg r "$(rid)" '{box_id:$b, request_id:$r}'; }
-
-# on_box_open BOX RESPONSE: take the new state and record what was inside
-on_box_open() {
-  take_me "$2"
-  record "$(jq -c --arg b "$1" --argjson ct "$CONTENT" '.result as $r | ($ct.items // {})[$r.item_id // ""] as $i |
-    {t: "box", box_id: $b, result: ($r + {item_name: $i.name, rarity: ($r.rarity // $i.rarity)})}' <<<"$2")"
-}
-
-do_open_box() {
-  local box=$1 res
-  if res=$(api POST /api/boxes/open "$(open_body "$box")"); then
-    on_box_open "$box" "$res"
-    log "OPENED $box -> $(jq -c '.result' <<<"$res")"
-  else
-    handle_error "open($box)" "$res" optional
-    return 1
-  fi
 }
 
 # ---- scrolls (drop from attacks; used as soon as we have one)
@@ -341,9 +337,6 @@ do_buy_box() {
   fi
 }
 
-# box_to_open: the first box in the bag, if any.
-box_to_open() { jq -er '[(.boxes // [])[] | select((.count // 1) > 0) | .box_id][0] // empty' <<<"$ME" 2>/dev/null; }
-
 # ---------------------------------------------------------------- boss kills
 
 # Record each boss defeat once, noting whether we landed the killing blow.
@@ -399,10 +392,6 @@ while true; do
   fi
   if action_ok scroll && scroll=$(scroll_to_use); then
     if do_use_scroll "$scroll"; then nap "$PAUSE"; continue; fi
-  fi
-  if action_ok box && box=$(box_to_open); then
-    if do_open_box "$box"; then nap "$PAUSE"; continue; fi
-    block_action box 120 "opening $box"
   fi
   if action_ok buy && can_buy; then
     if do_buy_box; then nap "$PAUSE"; continue; fi

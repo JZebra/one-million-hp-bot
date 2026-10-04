@@ -9,7 +9,7 @@ Every API response includes your updated player state (`me`), and the bot picks 
 1. **Ultimate ready** → use it. While it recharges, normal attacks are held and then all spent right after the next ultimate (see [The ultimate cycle](#the-ultimate-cycle)).
 2. **Scroll owned** → ignored by default. With `OMHP_SCROLLS=1`, the bot uses it right away; a scroll the server refuses (boss heal only works at 89% boss HP or lower) is set aside for 2 minutes instead of being retried every pass.
 3. **Boss at or below 10% HP** (`OMHP_OPEN_PCT`) → open a loot box, one per pass at the normal pace. Above that, boxes stay shut. Crit charges go on your next normal attacks, and below 10% boss HP every hit also gets your executioner bonus, so charges opened in the last phase are worth the most. `OMHP_OPEN_PCT=0` never opens boxes.
-4. **Enough shards for an Occult Ossuary** (500 by default) → buy one. It stays shut until the last phase like any other box.
+4. **Enough shards for the most expensive loot box** (currently the Void Reliquary, 500) → buy one. It stays shut until the last phase like any other box.
 5. **Attacks left** → attack, at most one normal attack every 0.8s (`OMHP_ATTACK_GAP`). The gap applies only to normal attacks; the ultimate, scrolls and purchases don't wait on it.
 6. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
 7. **Boss not alive** → check again every 30s until the next boss spawns.
@@ -41,15 +41,23 @@ Normally you get one ultimate per boss, but the admin can grant more, and so can
 
 The bot doesn't track any of these counts itself. It reads `ultimate_available` and `attacks_left` from the latest server state on every loop, so a regenerated ultimate or bonus attack gets used on the next pass. Grants that arrive while the bot is sleeping are seen at the next refresh, which is at most one recharge interval later.
 
-### Buying Occult Ossuaries
+### Buying loot boxes
 
-When your shard balance reaches the ossuary's price (500), the bot buys one; it's opened in the boss's last phase with the other boxes. It keeps buying as long as you can afford another. Set `OMHP_BUY_BOX=` to stop buying.
+By default (`OMHP_BUY_BOX=max`) the bot buys the **most expensive box in the shop** whenever your shards cover it. It reads the live prices from `me.shop.boxes`, which include any price changes the admin makes, so a new top-tier box is picked up automatically, and the log notes whenever the target changes. It saves up for that box rather than buying cheaper ones, and keeps buying as long as you can afford another.
 
-The ossuary's loot table was updated to drop godly items more often: epic 64.4%, legendary 28%, mythic 5.6%, **godly 1.9%**. Per shard, that's about 5× the cursed casket's godly odds (the casket is 0.1% godly at 100 shards). The casket is still better per shard for mythics (2.3% at 100) and gives crit charges; set `OMHP_BUY_BOX=cursed_casket` to go back to it.
+Current shop (as of 2026-10-04):
 
-- The price comes from `me.shop.boxes`, which includes any price changes the admin makes. If that field is missing, the bot uses the shop list at the time of writing (crate 10, chest 30, casket 100, ossuary 500).
-- To buy a different box, set `OMHP_BUY_BOX` to its ID (`wooden_crate`, `iron_chest`, `cursed_casket`, `occult_ossuary`). To turn buying off, set it to an empty string (`OMHP_BUY_BOX=`).
-- If the server refuses a purchase, the bot doesn't retry until your shard count changes, so it can't get stuck retrying the same failed purchase.
+| Box | Price | Contents |
+| --- | --- | --- |
+| **Void Reliquary** | 500 | epic 42%, legendary 40%, mythic 14%, **godly 4%** |
+| Occult Ossuary | 250 | epic 54.4%, legendary 23.6%, mythic 4.7%, godly 0.9%, scroll 16.4% |
+| Cursed Casket | 100 | rare 24.3%, epic 31.3%, legendary 11.8%, mythic 2.1%, godly 0.1%, 3 crit charges 23.2%, scroll 7.1% |
+| Iron Chest | 30 | 2 attacks 35%, uncommon–epic items, 2 crit charges 18.8% |
+| Wooden Crate | 10 | 1–2 attacks 49%, common–rare items, 1 crit charge 18.5% |
+
+- To buy a specific box instead, set `OMHP_BUY_BOX` to its ID (for example `occult_ossuary`). To turn buying off, set it to an empty string (`OMHP_BUY_BOX=`).
+- If `me.shop` is missing, the bot uses the price list above.
+- If the server refuses a purchase, the bot doesn't retry until your shard count changes, and buying is disabled for 5 minutes.
 
 ### Session summary
 
@@ -115,7 +123,7 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_PAUSE`      | `0.4`                       | Seconds between consecutive actions        |
 | `OMHP_ATTACK_GAP` | `0.8`                       | Minimum seconds between normal attacks (send to send); doesn't apply to the ultimate, scrolls or purchases |
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
-| `OMHP_BUY_BOX`    | `occult_ossuary`            | Box to buy with shards; empty disables buying |
+| `OMHP_BUY_BOX`    | `max`                       | `max` = the shop's most expensive box; or a box ID; empty disables buying |
 | `OMHP_SCROLLS`    | `0`                         | `1` = use scrolls as soon as you have them |
 | `OMHP_OPEN_PCT`   | `10`                        | Open loot boxes once the boss is at or below this % HP; `0` never opens them |
 | `OMHP_ULT_HOLD`   | `1`                         | Hold attacks while the ultimate recharges, spend them right after it; `0` attacks as they recharge |

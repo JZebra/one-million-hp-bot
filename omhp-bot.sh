@@ -9,7 +9,7 @@
 #   2. boss at or below OMHP_OPEN_PCT HP -> open a loot box (one per pass), so
 #      its crit charges land on attacks in the executioner window (<10% HP);
 #      above that, boxes stay shut
-#      enough shards      -> buy a box (default: occult ossuary)
+#      enough shards      -> buy the most expensive loot box in the shop
 # Every optional step (ultimate, scroll, buy) that errors is disabled for
 # a while and the pass falls through to a normal attack.
 #   3. attacks left       -> attack, at most one every OMHP_ATTACK_GAP seconds
@@ -35,7 +35,7 @@ ATTACK_GAP="${OMHP_ATTACK_GAP:-0.8}" # minimum seconds between normal attacks (n
 SCROLLS="${OMHP_SCROLLS:-0}"      # 1 = use scrolls as soon as we have them
 OPEN_PCT="${OMHP_OPEN_PCT:-10}"   # open loot boxes once the boss is at or below this % HP; 0 = never
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
-BUY_BOX="${OMHP_BUY_BOX-occult_ossuary}" # box to buy with shards; empty disables buying
+BUY_BOX="${OMHP_BUY_BOX-max}"     # box to buy: "max" = the shop's most expensive; a box id; empty = don't buy
 ULT_HOLD="${OMHP_ULT_HOLD:-1}"    # 1 = hold attacks while the ultimate recharges, spend them right after
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="${OMHP_LOG_DIR:-$SCRIPT_DIR/logs}"
@@ -342,34 +342,56 @@ do_use_scroll() {
   fi
 }
 
-# Price of BUY_BOX: me.shop has the admin's price changes applied; the
-# fallback is the shop list at the time of writing.
+# Fallback shop list (at the time of writing) if me.shop is missing.
+SHOP_FALLBACK='{"wooden_crate":10,"iron_chest":30,"cursed_casket":100,"occult_ossuary":250,"void_reliquary":500}'
+
+# buy_target: the box id to buy. With BUY_BOX=max, the most expensive box in
+# the live shop (me.shop has the admin's price changes applied), so a new
+# top-tier box is picked up automatically.
+buy_target() {
+  if [[ $BUY_BOX == max ]]; then
+    jq -r --argjson fb "$SHOP_FALLBACK" '(.shop.boxes // $fb) | to_entries
+      | map(select(.value | type == "number")) | max_by(.value) | .key // empty' <<<"$ME" 2>/dev/null
+  else
+    printf '%s' "$BUY_BOX"
+  fi
+}
+
+# box_price BOX: its live price, or the fallback list's.
 box_price() {
-  jq -r --arg b "$BUY_BOX" '.shop.boxes[$b] // ({wooden_crate: 10, iron_chest: 30, cursed_casket: 100, occult_ossuary: 500}[$b]) // 100' <<<"$ME"
+  jq -r --arg b "$1" --argjson fb "$SHOP_FALLBACK" '.shop.boxes[$b] // $fb[$b] // empty' <<<"$ME" 2>/dev/null
 }
 
 # Set after a refused purchase so we don't retry until the shard count changes.
 BUY_BLOCKED_AT=""
+LAST_BUY_TARGET=""
 
 can_buy() {
   [[ -n $BUY_BOX ]] || return 1
-  local shards
-  shards=$(jq -r '.shards // 0' <<<"$ME")
-  [[ $shards != "$BUY_BLOCKED_AT" ]] && (( shards >= $(box_price) ))
+  local shards box price
+  box=$(buy_target); [[ -n $box ]] || return 1
+  price=$(box_price "$box"); [[ $price =~ ^[0-9]+$ ]] || return 1
+  if [[ $box != "$LAST_BUY_TARGET" ]]; then
+    log "buying target: $box ($price shards)"
+    LAST_BUY_TARGET=$box
+  fi
+  shards=$(me_num shards 0)
+  [[ $shards != "$BUY_BLOCKED_AT" ]] && (( shards >= price ))
 }
 
 do_buy_box() {
-  local res shards price
-  shards=$(jq -r '.shards // 0' <<<"$ME")
-  price=$(box_price)
-  if res=$(api POST /api/shop/buy "$(jq -nc --arg b "$BUY_BOX" '{box_id:$b}')"); then
+  local res shards price box
+  box=$(buy_target)
+  shards=$(me_num shards 0)
+  price=$(box_price "$box")
+  if res=$(api POST /api/shop/buy "$(jq -nc --arg b "$box" '{box_id:$b}')"); then
     take_me "$res"
     BUY_BLOCKED_AT=""
-    record "$(jq -nc --arg b "$BUY_BOX" --argjson p "$price" '{t: "buy", box_id: $b, price: $p}')"
-    log "BOUGHT $BUY_BOX for $price shards  ($(jq -r '.shards // 0' <<<"$ME") left)"
+    record "$(jq -nc --arg b "$box" --argjson p "${price:-0}" '{t: "buy", box_id: $b, price: $p}')"
+    log "BOUGHT $box for $price shards  ($(me_num shards 0) left)"
   else
     BUY_BLOCKED_AT=$shards
-    handle_error "buy($BUY_BOX)" "$res" optional
+    handle_error "buy($box)" "$res" optional
     return 1
   fi
 }
@@ -436,7 +458,7 @@ while true; do
   fi
   if action_ok buy && can_buy; then
     if do_buy_box; then nap "$PAUSE"; continue; fi
-    block_action buy 300 "buying $BUY_BOX"
+    block_action buy 300 "buying $(buy_target)"
   fi
 
   left=$(me_num attacks_left -1)

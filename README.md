@@ -7,9 +7,9 @@ A small bash bot that plays [ONE MILLION HP](https://onemillionhp.com) for you.
 Every API response includes your updated player state (`me`), and the bot picks its next move from it:
 
 1. **Ultimate ready** → use it. While it recharges, normal attacks are held and then all spent right after the next ultimate (see [The ultimate cycle](#the-ultimate-cycle)).
-2. **Scroll owned** → use it right away. Scrolls replaced the ultimate and drop from attacks (freezing, poison, treasure, attack steal, boss heal). If the server refuses one (boss heal only works at 89% boss HP or lower), that scroll is set aside for 2 minutes instead of being retried every pass. Scrolls used are listed in the session summary.
+2. **Scroll owned** → ignored by default. With `OMHP_SCROLLS=1`, the bot uses it right away; a scroll the server refuses (boss heal only works at 89% boss HP or lower) is set aside for 2 minutes instead of being retried every pass.
 3. **Enough shards for an Occult Ossuary** (500 by default) → buy one. The bot never opens boxes: bought and dropped boxes stay in your bag for you to open in the web UI.
-4. **Attacks left** → attack, at most one normal attack every 1.5s (`OMHP_ATTACK_GAP`). The gap applies only to normal attacks; the ultimate, scrolls and purchases don't wait on it.
+4. **Attacks left** → attack, at most one normal attack every 0.8s (`OMHP_ATTACK_GAP`). The gap applies only to normal attacks; the ultimate, scrolls and purchases don't wait on it.
 5. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
 6. **Boss not alive** → check again every 30s until the next boss spawns.
 
@@ -22,7 +22,7 @@ The ultimate recharges on a 60-second timer (`me.ultimate_ready_at`, `me.ult_rec
 - A refund 55s into the cycle only moves the next ultimate up by ~5s.
 - A refund 1s in is worth a whole extra ultimate.
 
-The bot therefore holds normal attacks while the ultimate recharges, fires the ultimate the moment it's ready, then spends every held attack, one every 1.5s (`OMHP_ATTACK_GAP`). A refund during that spend fires the next ultimate immediately and restarts the cycle. Holding never goes past the attack cap (20), so no recharge is wasted, and the bot wakes exactly when the ultimate or the next attack is due instead of up to 5s late.
+The bot therefore holds normal attacks while the ultimate recharges, fires the ultimate the moment it's ready, then spends every held attack, one every 0.8s (`OMHP_ATTACK_GAP`). A refund during that spend fires the next ultimate immediately and restarts the cycle. Holding never goes past the attack cap (20), so no recharge is wasted, and the bot wakes exactly when the ultimate or the next attack is due instead of up to 5s late.
 
 | Strategy (model, 1.5% refund, ~1,000-damage ultimates) | Ultimates/h | Damage |
 | --- | --- | --- |
@@ -113,9 +113,10 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_TOKEN`      | required                    | Your bearer token                          |
 | `OMHP_API`        | `https://onemillionhp.com`  | API origin                                 |
 | `OMHP_PAUSE`      | `0.4`                       | Seconds between consecutive actions        |
-| `OMHP_ATTACK_GAP` | `1.5`                       | Minimum seconds between normal attacks (send to send); doesn't apply to the ultimate, scrolls or purchases |
+| `OMHP_ATTACK_GAP` | `0.8`                       | Minimum seconds between normal attacks (send to send); doesn't apply to the ultimate, scrolls or purchases |
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
 | `OMHP_BUY_BOX`    | `occult_ossuary`            | Box to buy with shards; empty disables buying |
+| `OMHP_SCROLLS`    | `0`                         | `1` = use scrolls as soon as you have them |
 | `OMHP_ULT_HOLD`   | `1`                         | Hold attacks while the ultimate recharges, spend them right after it; `0` attacks as they recharge |
 | `OMHP_ULT_BACKOFF`| `600`                       | Longest wait after repeated ultimate refusals (starts at 5s) |
 | `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |

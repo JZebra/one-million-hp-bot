@@ -5,7 +5,7 @@
 #   1. ultimate ready     -> use it
 #      ultimate recharging -> hold normal attacks (except at the attack cap),
 #                             then spend them all right after the ultimate
-#      scroll owned        -> use it (scrolls replaced the ultimate)
+#      scroll owned        -> use it, only with OMHP_SCROLLS=1 (off by default)
 #   2. enough shards      -> buy a box (default: occult ossuary)
 #      Boxes are never opened: they stay in the bag for you to open by hand.
 # Every optional step (ultimate, scroll, buy) that errors is disabled for
@@ -29,7 +29,8 @@ set -uo pipefail
 
 API="${OMHP_API:-https://onemillionhp.com}"
 PAUSE="${OMHP_PAUSE:-0.4}"        # seconds between consecutive actions
-ATTACK_GAP="${OMHP_ATTACK_GAP:-1.5}" # minimum seconds between normal attacks (not ultimates etc.)
+ATTACK_GAP="${OMHP_ATTACK_GAP:-0.8}" # minimum seconds between normal attacks (not ultimates etc.)
+SCROLLS="${OMHP_SCROLLS:-0}"      # 1 = use scrolls as soon as we have them
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
 BUY_BOX="${OMHP_BUY_BOX-occult_ossuary}" # box to buy with shards; empty disables buying
 ULT_HOLD="${OMHP_ULT_HOLD:-1}"    # 1 = hold attacks while the ultimate recharges, spend them right after
@@ -390,7 +391,7 @@ while true; do
     ULT_FAILS=$((ULT_FAILS + 1))
     block_action ult "$(ult_backoff)" "ultimate refused, $ULT_FAILS in a row"
   fi
-  if action_ok scroll && scroll=$(scroll_to_use); then
+  if [[ $SCROLLS == 1 ]] && action_ok scroll && scroll=$(scroll_to_use); then
     if do_use_scroll "$scroll"; then nap "$PAUSE"; continue; fi
   fi
   if action_ok buy && can_buy; then

@@ -8,11 +8,10 @@ Every API response includes your updated player state (`me`), and the bot picks 
 
 1. **Ultimate ready** → use it. While it recharges, normal attacks are held and then all spent right after the next ultimate (see [The ultimate cycle](#the-ultimate-cycle)).
 2. **Scroll owned** → ignored by default. With `OMHP_SCROLLS=1`, the bot uses it right away; a scroll the server refuses (boss heal only works at 89% boss HP or lower) is set aside for 2 minutes instead of being retried every pass.
-3. **Boss at or below 10% HP** (`OMHP_OPEN_PCT`) → open a loot box, one per pass at the normal pace. Above that, boxes stay shut. Crit charges go on your next normal attacks, and below 10% boss HP every hit also gets your executioner bonus, so charges opened in the last phase are worth the most. `OMHP_OPEN_PCT=0` never opens boxes.
-4. **Enough shards for the most expensive loot box** (currently the Void Reliquary, 500) → buy one. It stays shut until the last phase like any other box.
-5. **Attacks left** → attack, at most one normal attack every 0.8s (`OMHP_ATTACK_GAP`). The gap applies only to normal attacks; the ultimate, scrolls and purchases don't wait on it.
-6. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
-7. **Boss not alive** → check again every 30s until the next boss spawns.
+3. **Enough shards for the most expensive loot box** (currently the Void Reliquary, 500) → buy one. The bot never opens boxes: bought and dropped boxes stay in your bag for you to open in the web UI.
+4. **Attacks left** → attack, at most one normal attack every 0.8s (`OMHP_ATTACK_GAP`). The gap applies only to normal attacks; the ultimate, scrolls and purchases don't wait on it.
+5. **Nothing to do** → sleep until the next attack recharges (`next_attack_at`), then refresh.
+6. **Boss not alive** → check again every 30s until the next boss spawns.
 
 Attacks recharge one every 5s, up to 20 stored.
 
@@ -61,7 +60,7 @@ Current shop (as of 2026-10-04):
 
 ### Session summary
 
-Every attack, box opening, scroll use and purchase is appended to `logs/session-YYYYMMDD-HHMMSS.jsonl`. When the bot stops (Ctrl-C, `kill`, or `systemctl stop`), it prints a summary built from that file:
+Every attack, scroll use and purchase is appended to `logs/session-YYYYMMDD-HHMMSS.jsonl`. When the bot stops (Ctrl-C, `kill`, or `systemctl stop`), it prints a summary built from that file:
 
 ```
 =============== SESSION SUMMARY ===============
@@ -125,7 +124,6 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
 | `OMHP_BUY_BOX`    | `max`                       | `max` = the shop's most expensive box; or a box ID; empty disables buying |
 | `OMHP_SCROLLS`    | `0`                         | `1` = use scrolls as soon as you have them |
-| `OMHP_OPEN_PCT`   | `10`                        | Open loot boxes once the boss is at or below this % HP; `0` never opens them |
 | `OMHP_ULT_HOLD`   | `1`                         | Hold attacks while the ultimate recharges, spend them right after it; `0` attacks as they recharge |
 | `OMHP_ULT_BACKOFF`| `600`                       | Longest wait after repeated ultimate refusals (starts at 5s) |
 | `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |
@@ -165,7 +163,7 @@ All authenticated calls send `Authorization: Bearer <token>`. The `request_id` m
 
 The game changes often (the ultimate was removed mid-boss, fields get added and renamed). The bot is built so that whatever breaks, it falls back to **normal attacks**:
 
-- **Optional actions back off.** The ultimate, scrolls, box opening and buying are all optional. If one errors, it's disabled for a while (ultimate from 5s doubling up to 10 min, buying 5 min, boxes 2 min, each refused scroll 2 min), and the same pass carries on to a normal attack. A broken feature costs one attempt per backoff, never all your attacks. Optional actions don't wait after an error.
+- **Optional actions back off.** The ultimate, scrolls and buying are all optional. If one errors, it's disabled for a while (ultimate from 5s doubling up to 10 min, buying 5 min, each refused scroll 2 min), and the same pass carries on to a normal attack. A broken feature costs one attempt per backoff, never all your attacks. Optional actions don't wait after an error.
 - **Missing or renamed fields default to attacking.** If `attacks_left` is missing, the bot attacks anyway and lets the server answer `NO_ATTACKS`. It then waits one recharge interval (`recharge_seconds`, or 5s) before trying again. If `next_attack_at` is missing, it waits the recharge interval. A response without `me` triggers a fresh `/api/me`.
 - **Non-JSON responses** (proxy error pages, moved endpoints) are turned into an error with the HTTP status, so the bot never tries to parse HTML.
 - **No tight loops.** Every failure path waits at least a moment.

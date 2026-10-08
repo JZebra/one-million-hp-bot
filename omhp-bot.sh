@@ -6,10 +6,8 @@
 #      ultimate recharging -> hold normal attacks (except at the attack cap),
 #                             then spend them all right after the ultimate
 #      scroll owned        -> use it, only with OMHP_SCROLLS=1 (off by default)
-#   2. boss at or below OMHP_OPEN_PCT HP -> open a loot box (one per pass), so
-#      its crit charges land on attacks in the executioner window (<10% HP);
-#      above that, boxes stay shut
-#      enough shards      -> buy the most expensive loot box in the shop
+#   2. enough shards      -> buy the most expensive loot box in the shop
+#      Boxes are never opened: they stay in the bag for you to open by hand.
 # Every optional step (ultimate, scroll, buy) that errors is disabled for
 # a while and the pass falls through to a normal attack.
 #   3. attacks left       -> attack, at most one every OMHP_ATTACK_GAP seconds
@@ -33,7 +31,6 @@ API="${OMHP_API:-https://onemillionhp.com}"
 PAUSE="${OMHP_PAUSE:-0.4}"        # seconds between consecutive actions
 ATTACK_GAP="${OMHP_ATTACK_GAP:-0.8}" # minimum seconds between normal attacks (not ultimates etc.)
 SCROLLS="${OMHP_SCROLLS:-0}"      # 1 = use scrolls as soon as we have them
-OPEN_PCT="${OMHP_OPEN_PCT:-10}"   # open loot boxes once the boss is at or below this % HP; 0 = never
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
 BUY_BOX="${OMHP_BUY_BOX-max}"     # box to buy: "max" = the shop's most expensive; a box id; empty = don't buy
 ULT_HOLD="${OMHP_ULT_HOLD:-1}"    # 1 = hold attacks while the ultimate recharges, spend them right after
@@ -180,7 +177,7 @@ handle_error() {
   refresh || [[ -n $optional ]] || nap 3
 }
 
-# ---- resilience: optional actions (ultimate, scroll, box, buy) back
+# ---- resilience: optional actions (ultimate, scroll, buy) back
 # off after an error and the pass falls through to a normal attack, so a game
 # change can cost at most one attempt per backoff, never all our attacks.
 ACTION_BLOCKED="" # "name:until ..."
@@ -283,39 +280,6 @@ on_attack() {
     while read -r line; do log "$line"; done
   [[ -n $quiet ]] || log "  $(stats)"
 }
-
-# ---- loot boxes: kept shut until the boss's last phase, then opened one per
-# pass so their crit charges go on attacks while executioner gear (below 10%
-# boss HP) boosts every hit.
-
-open_body() { jq -nc --arg b "$1" --arg r "$(rid)" '{box_id:$b, request_id:$r}'; }
-
-# on_box_open BOX RESPONSE: take the new state and record what was inside
-on_box_open() {
-  take_me "$2"
-  record "$(jq -c --arg b "$1" --argjson ct "$CONTENT" '.result as $r | ($ct.items // {})[$r.item_id // ""] as $i |
-    {t: "box", box_id: $b, result: ($r + {item_name: $i.name, rarity: ($r.rarity // $i.rarity)})}' <<<"$2" 2>/dev/null)"
-}
-
-do_open_box() {
-  local box=$1 res
-  if res=$(api POST /api/boxes/open "$(open_body "$box")"); then
-    on_box_open "$box" "$res"
-    log "OPENED $box -> $(jq -c '.result' <<<"$res" 2>/dev/null)"
-  else
-    handle_error "open($box)" "$res" optional
-    return 1
-  fi
-}
-
-# last_phase: the boss is alive and at or below OPEN_PCT of its max HP.
-last_phase() {
-  jq -e --argjson pct "$OPEN_PCT" '$pct > 0 and .status == "alive" and (.hp | type) == "number"
-    and (.max_hp | type) == "number" and .hp <= .max_hp * $pct / 100' <<<"$BOSS" >/dev/null 2>&1
-}
-
-# box_to_open: the first box in the bag, if any.
-box_to_open() { jq -er '[(.boxes // [])[] | select((.count // 1) > 0) | .box_id][0] // empty' <<<"$ME" 2>/dev/null; }
 
 # ---- scrolls (drop from attacks; used as soon as we have one)
 
@@ -451,10 +415,6 @@ while true; do
   fi
   if [[ $SCROLLS == 1 ]] && action_ok scroll && scroll=$(scroll_to_use); then
     if do_use_scroll "$scroll"; then nap "$PAUSE"; continue; fi
-  fi
-  if last_phase && action_ok box && box=$(box_to_open); then
-    if do_open_box "$box"; then nap "$PAUSE"; continue; fi
-    block_action box 120 "opening $box"
   fi
   if action_ok buy && can_buy; then
     if do_buy_box; then nap "$PAUSE"; continue; fi

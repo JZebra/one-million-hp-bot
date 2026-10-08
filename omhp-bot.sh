@@ -8,6 +8,10 @@
 #      scroll owned        -> use it, only with OMHP_SCROLLS=1 (off by default)
 #   2. enough shards      -> buy the most expensive loot box in the shop
 #      Boxes are never opened: they stay in the bag for you to open by hand.
+# Captcha: if the game asks "are you human?" (me.captcha, pushed by its bot
+# scan), the bot pauses everything, tells you, and waits for you to answer it
+# in the web UI. It never answers captchas itself.
+#
 # Every optional step (ultimate, scroll, buy) that errors is disabled for
 # a while and the pass falls through to a normal attack.
 #   3. attacks left       -> attack, at most one every OMHP_ATTACK_GAP seconds
@@ -31,6 +35,8 @@ API="${OMHP_API:-https://onemillionhp.com}"
 PAUSE="${OMHP_PAUSE:-0.4}"        # seconds between consecutive actions
 ATTACK_GAP="${OMHP_ATTACK_GAP:-0.8}" # minimum seconds between normal attacks (not ultimates etc.)
 SCROLLS="${OMHP_SCROLLS:-0}"      # 1 = use scrolls as soon as we have them
+CAPTCHA_POLL="${OMHP_CAPTCHA_POLL:-30}" # seconds between checks while a captcha waits for you
+NOTIFY="${OMHP_NOTIFY:-1}"        # 1 = macOS notification when a captcha appears (needs osascript)
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
 BUY_BOX="${OMHP_BUY_BOX-max}"     # box to buy: "max" = the shop's most expensive; a box id; empty = don't buy
 ULT_HOLD="${OMHP_ULT_HOLD:-1}"    # 1 = hold attacks while the ultimate recharges, spend them right after
@@ -68,6 +74,7 @@ summarize() {
         "Attacks         \($atk | length | c)   (normal \($norm | length | c), crit \($crit | length | c), ultimate \($ult | length | c))",
         "Total damage    \($atk | map(.damage) | add // 0 | c)",
         "Avg damage      normal \($norm | avg)   crit \($crit | avg)   ultimate \($ult | avg)",
+        "Captchas        \(map(select(.t == "captcha" and .state == "pending")) | length)\(map(select(.t == "captcha" and .state == "cleared") | .waited) | if length > 0 then " (paused \(add / 60 | floor)m \(add % 60)s in total)" else "" end)",
         "Scrolls used    \(map(select(.t == "scroll")) | if length == 0 then "none" else (group_by(.scroll_id) | map("\(.[0].scroll_id) x\(length)") | join(", ")) end)",
         "Last hits       \($kills | map(select(.mine)) | length) of \($kills | length) boss kill(s) seen",
         "Loot boxes      \($boxes | length) opened\(if ($buys | length) > 0 then "  (\($buys | length) bought for \($buys | map(.price) | add | c) shards)" else "" end)",
@@ -257,6 +264,8 @@ do_attack() { # kind = normal | ultimate; returns 1 if the server refused it
   local kind=$1 res
   [[ $kind == normal ]] && attack_gap_wait
   if res=$(api POST /api/attack "$(attack_body "$kind")"); then
+    LAST_ERROR=""
+    captcha_cleared
     on_attack "$kind" "$res"
   else
     handle_error "attack($kind)" "$res" $([[ $kind == ultimate ]] && echo optional)
@@ -360,6 +369,49 @@ do_buy_box() {
   fi
 }
 
+# ---------------------------------------------------------------- captcha
+
+# The game's bot scan can push an "are you human?" check (me.captcha). Until
+# it's answered, the server refuses attacks and scrolls, and 10 wrong answers
+# in total ban the account. The bot never answers it (that's yours to do in
+# the web UI): it stops sending actions, tells you, and checks back every
+# CAPTCHA_POLL seconds.
+CAPTCHA_SINCE="" # when the current captcha was noticed
+
+captcha_pending() {
+  [[ $(jq -r 'if .captcha then "yes" else "no" end' <<<"$ME" 2>/dev/null) == yes ]] && return 0
+  # A refused attack whose error mentions a captcha counts too, in case the
+  # field is renamed.
+  [[ $LAST_ERROR == *CAPTCHA* || $LAST_ERROR == *HUMAN* ]]
+}
+
+notify() { # TITLE MESSAGE
+  [[ $NOTIFY == 1 ]] && command -v osascript >/dev/null || return 0
+  osascript -e "display notification \"$2\" with title \"$1\" sound name \"Ping\"" >/dev/null 2>&1 || true
+}
+
+captcha_wait() {
+  if [[ -z $CAPTCHA_SINCE ]]; then
+    CAPTCHA_SINCE=$(date +%s)
+    log "!!! CAPTCHA: the game wants to know you're human. Answer it in the web UI."
+    log "!!! Attacks are paused until it's solved (checking every ${CAPTCHA_POLL}s). The bot won't answer it."
+    record '{"t":"captcha","state":"pending"}'
+    notify "One Million HP" "Captcha waiting: answer it in the web UI. The bot is paused."
+  fi
+  nap "$CAPTCHA_POLL"
+  LAST_ERROR=""   # re-check from fresh state (if only an error flagged it, the
+  refresh || nap 5 # next attack is the probe; the warning isn't repeated)
+}
+
+# Called after a successful attack: if a captcha was pending, it's solved.
+captcha_cleared() {
+  [[ -n $CAPTCHA_SINCE ]] || return 0
+  local waited=$(( $(date +%s) - CAPTCHA_SINCE ))
+  log "captcha solved (paused ${waited}s); resuming"
+  record "$(jq -nc --argjson s "$waited" '{t: "captcha", state: "cleared", waited: $s}')"
+  CAPTCHA_SINCE=""
+}
+
 # ---------------------------------------------------------------- boss kills
 
 # Record each boss defeat once, noting whether we landed the killing blow.
@@ -399,6 +451,8 @@ log "Playing as $(jq -r '.name // .id' <<<"$ME")  (clock skew ${SKEW}s)"
 log "  $(stats)"
 
 while true; do
+  if captcha_pending; then captcha_wait; continue; fi
+
   status=$(jq -r '.status // "alive"' <<<"$BOSS")
   if [[ $status != alive ]]; then
     note_defeat

@@ -15,6 +15,16 @@ Every API response includes your updated player state (`me`), and the bot picks 
 
 Attacks recharge one every 5s, up to 20 stored.
 
+### Captchas
+
+The game's bot scan can push an "ARE YOU HUMAN?" check to a player (`me.captcha`). Until it's answered, the server refuses attacks and scrolls, and 10 wrong answers in total ban the account. **The bot never answers captchas.** When one is pending it:
+
+- stops sending actions (attacks, the ultimate, scrolls, purchases) and only refreshes your state every 30s (`OMHP_CAPTCHA_POLL`);
+- logs `!!! CAPTCHA: ... Answer it in the web UI.`, records it in the session log, and on macOS shows a notification (`OMHP_NOTIFY=0` turns that off; there's no notification where `osascript` doesn't exist, such as a Linux VPS);
+- resumes as soon as an attack goes through again and logs how long it was paused. The session summary counts captchas and the total pause.
+
+If the server only signals the captcha through an error code on a refused attack (no `me.captcha` field), the bot still pauses, probing with one attack per check instead of retrying every second.
+
 ### The ultimate cycle
 
 The ultimate recharges on a 60-second timer (`me.ultimate_ready_at`, `me.ult_recharge`), and each normal attack has a chance to refund a spent one (1.5% with LAST SAVE POINT). Your logs show the timer **restarts when the ultimate is used**: after a refunded ultimate, the next timed one came 55–65s later. So when a refund happens matters:
@@ -124,6 +134,8 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
 | `OMHP_BUY_BOX`    | `max`                       | `max` = the shop's most expensive box; or a box ID; empty disables buying |
 | `OMHP_SCROLLS`    | `0`                         | `1` = use scrolls as soon as you have them |
+| `OMHP_CAPTCHA_POLL` | `30`                      | Seconds between checks while a captcha waits for you |
+| `OMHP_NOTIFY`     | `1`                         | macOS notification when a captcha appears; `0` turns it off |
 | `OMHP_ULT_HOLD`   | `1`                         | Hold attacks while the ultimate recharges, spend them right after it; `0` attacks as they recharge |
 | `OMHP_ULT_BACKOFF`| `600`                       | Longest wait after repeated ultimate refusals (starts at 5s) |
 | `OMHP_LOG_DIR`    | `./logs` (next to the script) | Where session logs are written            |

@@ -6,7 +6,7 @@ A small bash bot that plays [ONE MILLION HP](https://onemillionhp.com) for you.
 
 Every API response includes your updated player state (`me`), and the bot picks its next move from it:
 
-1. **Ultimate ready** → use it. While it recharges, normal attacks are held and then all spent right after the next ultimate (see [The ultimate cycle](#the-ultimate-cycle)).
+1. **Ultimate ready** → use it. While it recharges, the bot attacks normally until the ultimate is closer than the time it takes to refill the attack cap, then banks attacks and spends them all right after the next ultimate (see [The ultimate cycle](#the-ultimate-cycle)).
 2. **Scroll owned** → ignored by default. With `OMHP_SCROLLS=1`, the bot uses it right away; a scroll the server refuses (boss heal only works at 89% boss HP or lower) is set aside for 2 minutes instead of being retried every pass.
 3. **Enough shards for the most expensive loot box** (currently the Void Reliquary, 500) → buy one. The bot never opens boxes: bought and dropped boxes stay in your bag for you to open in the web UI.
 4. **Attacks left** → attack, at most one normal attack every 0.8s (`OMHP_ATTACK_GAP`). The gap applies only to normal attacks; the ultimate, scrolls and purchases don't wait on it.
@@ -32,7 +32,7 @@ The ultimate recharges on a 60-second timer (`me.ultimate_ready_at`, `me.ult_rec
 - A refund 55s into the cycle only moves the next ultimate up by ~5s.
 - A refund 1s in is worth a whole extra ultimate.
 
-The bot therefore holds normal attacks while the ultimate recharges, fires the ultimate the moment it's ready, then spends every held attack, one every 0.8s (`OMHP_ATTACK_GAP`). A refund during that spend fires the next ultimate immediately and restarts the cycle. Holding never goes past the attack cap (20), so no recharge is wasted, and the bot wakes exactly when the ultimate or the next attack is due instead of up to 5s late.
+The recharge time has changed since (`me.ult_recharge`, 156.5s on 2026-10-11, with attacks every 4.55s and a cap of 23), so holding for the whole cycle would sit at the cap. The bot attacks normally while the ultimate is further away than the time to refill the cap (time to the next attack plus one recharge per further missing attack, ~105s from empty right now), then banks attacks so the bank is full just as the ultimate is ready. It fires the ultimate the moment it's ready, then spends every banked attack, one every 0.8s (`OMHP_ATTACK_GAP`). A refund during that spend fires the next ultimate immediately and restarts the cycle. Holding never goes past the attack cap (20), so no recharge is wasted, and the bot wakes exactly when the ultimate or the next attack is due instead of up to 5s late.
 
 | Strategy (model, 1.5% refund, ~1,000-damage ultimates) | Ultimates/h | Damage |
 | --- | --- | --- |
@@ -40,7 +40,7 @@ The bot therefore holds normal attacks while the ultimate recharges, fires the u
 | Same, waking exactly when the ultimate is ready | 65.0 | +3.5% |
 | **Hold until the ultimate, then spend everything** | **70.1** | **+9.9%** |
 
-Against a mock server with the same mechanics sped up 5× (12s timer, 10% refunds), holding got 12/9/9 ultimates per minute against 9/8/8 without, with identical refund luck. Set `OMHP_ULT_HOLD=0` to attack as attacks recharge instead.
+Against a mock server with the same mechanics sped up 5× (12s timer, 10% refunds), holding got 12/9/9 ultimates per minute against 9/8/8 without, with identical refund luck. With a long timer (mock: 100s ultimate, an attack every 3s, cap 20, 10% refunds, 5 minutes), banking only inside the refill window got 14 ultimates and 99 attacks against 13 and 97 for holding the whole cycle, with no recharge wasted either way. Set `OMHP_ULT_HOLD=0` to attack as attacks recharge instead.
 
 If the server refuses an ultimate, the bot retries after 5s, doubling on each refusal in a row up to `OMHP_ULT_BACKOFF` (600s). While the ultimate is backed off, attacks aren't held.
 

@@ -3,8 +3,10 @@
 #
 # Loop, driven by the `me` object every API response returns:
 #   1. ultimate ready     -> use it
-#      ultimate recharging -> hold normal attacks (except at the attack cap),
-#                             then spend them all right after the ultimate
+#      ultimate recharging -> attack normally while the ultimate is further
+#                             away than the time to refill the attack cap;
+#                             closer than that, hold attacks, then spend them
+#                             all right after the ultimate
 #      scroll owned        -> use it, only with OMHP_SCROLLS=1 (off by default)
 #   2. enough shards      -> buy the most expensive loot box in the shop
 #      Boxes are never opened: they stay in the bag for you to open by hand.
@@ -243,6 +245,17 @@ ult_ready() {
   else [[ $(jq -r '.ultimate_available // false' <<<"$ME" 2>/dev/null) == true ]]; fi
 }
 
+# cap_fill_time LEFT CAP: seconds until the attack bank is full (time to the
+# next attack, plus one recharge per further missing attack), or nothing if
+# attacks_left isn't known.
+cap_fill_time() {
+  (( $1 < 0 )) && return 0
+  jq -rn --argjson left "$1" --argjson cap "$2" --argjson me "$ME" --argjson skew "$SKEW" '
+    ($me.recharge_seconds // 5) as $r
+    | (if ($me.next_attack_at | type) == "number" then [$me.next_attack_at - (now + $skew), 0] | max else $r end) as $next
+    | if $left >= $cap then 0 else $next + ($cap - $left - 1) * $r end | . * 10 | round / 10' 2>/dev/null
+}
+
 ult_backoff() { # seconds to wait after the Nth refusal in a row
   awk -v n="$ULT_FAILS" -v max="$ULT_BACKOFF" 'BEGIN { s = 5 * 2 ^ (n - 1); print (s > max ? max : s) }'
 }
@@ -478,15 +491,19 @@ while true; do
   left=$(me_num attacks_left -1)
   uwait=$(ult_wait)
 
-  # Ultimate cycle: a refund proc restarts the 60s timer, so a refund right
-  # after an ultimate is worth a whole extra one, while one late in the cycle
-  # only moves it up a few seconds. So hold normal attacks while the ultimate
-  # recharges and spend them all right after it. Never hold at the attack cap
-  # (recharge would be wasted), and only while the ultimate is working.
-  if [[ $ULT_HOLD == 1 && $SPAM == false && -n $uwait ]] && action_ok ult \
-     && (( left < $(me_num attacks_per_day 20) )); then
+  # Ultimate cycle: a refund proc restarts the ultimate timer, so a refund
+  # right after an ultimate is worth a whole extra one, while one late in the
+  # cycle only moves it up a little. So bank attacks for the ultimate and
+  # spend them right after it, but only start banking once the ultimate is
+  # closer than the time it takes to refill the attack cap: holding earlier
+  # would sit at the cap and waste recharge. (The timer is me.ult_recharge,
+  # which has changed from 60s; this adapts to whatever it is.)
+  per=$(me_num attacks_per_day 20)
+  fill=$(cap_fill_time "$left" "$per")
+  if [[ $ULT_HOLD == 1 && $SPAM == false && -n $uwait ]] && action_ok ult && (( left < per )) \
+     && { [[ -z $fill ]] || awk -v u="$uwait" -v f="$fill" 'BEGIN { exit !(u <= f) }'; }; then
     if [[ ${HOLD_LOGGED:-} != "$(jq -r '.ultimate_ready_at' <<<"$ME")" ]]; then
-      log "holding attacks for the ultimate (ready in ${uwait}s, $left held)"
+      log "holding attacks for the ultimate (ready in ${uwait}s, $left/$per held, cap in ${fill:-?}s)"
       HOLD_LOGGED=$(jq -r '.ultimate_ready_at' <<<"$ME")
     fi
     # Sleep to whichever comes first: the ultimate, or the next attack.

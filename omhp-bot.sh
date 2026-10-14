@@ -10,6 +10,10 @@
 #      scroll owned        -> use it, only with OMHP_SCROLLS=1 (off by default)
 #   2. enough shards      -> buy the most expensive loot box in the shop
 #      Boxes are never opened: they stay in the bag for you to open by hand.
+# Loadouts: before an ultimate (or an attack with banked crit charges) the bot
+# wears the damage loadout (OMHP_DMG_LOADOUT, "DMG" / slot L1); before normal
+# attacks it wears the loot loadout (OMHP_LOOT_LOADOUT, "LOOTMAXXING" / L2).
+#
 # Captcha: if the game asks "are you human?" (me.captcha, pushed by its bot
 # scan), the bot pauses everything, tells you, and waits for you to answer it
 # in the web UI. It never answers captchas itself.
@@ -39,6 +43,9 @@ ATTACK_GAP="${OMHP_ATTACK_GAP:-0.8}" # minimum seconds between normal attacks (n
 SCROLLS="${OMHP_SCROLLS:-0}"      # 1 = use scrolls as soon as we have them
 CAPTCHA_POLL="${OMHP_CAPTCHA_POLL:-30}" # seconds between checks while a captcha waits for you
 NOTIFY="${OMHP_NOTIFY:-1}"        # 1 = macOS notification when a captcha appears (needs osascript)
+SWAP="${OMHP_SWAP:-1}"            # 1 = swap loadouts: damage set for ultimates/charged crits, loot set for normal attacks
+DMG_LOADOUT="${OMHP_DMG_LOADOUT:-DMG}"          # damage loadout: its name, or L1/L2/L3
+LOOT_LOADOUT="${OMHP_LOOT_LOADOUT:-LOOTMAXXING}" # loot loadout: its name, or L1/L2/L3
 DEAD_POLL="${OMHP_DEAD_POLL:-30}" # seconds between checks while no boss is alive
 BUY_BOX="${OMHP_BUY_BOX-max}"     # box to buy: "max" = the shop's most expensive; a box id; empty = don't buy
 ULT_HOLD="${OMHP_ULT_HOLD:-1}"    # 1 = hold attacks while the ultimate recharges, spend them right after
@@ -76,6 +83,8 @@ summarize() {
         "Attacks         \($atk | length | c)   (normal \($norm | length | c), crit \($crit | length | c), ultimate \($ult | length | c))",
         "Total damage    \($atk | map(.damage) | add // 0 | c)",
         "Avg damage      normal \($norm | avg)   crit \($crit | avg)   ultimate \($ult | avg)",
+        ( $atk | map(select(.loadout != null and .loadout != "")) | group_by(.loadout) | .[]
+          | "  in \(.[0].loadout): \(length) attacks; normal \(map(select(.kind == "normal" and (.crit | not)) | .damage) | avg), crit \(map(select(.kind == "normal" and .crit) | .damage) | avg), ultimate \(map(select(.kind == "ultimate") | .damage) | avg), items \(map(select(.item_id)) | length), boxes \(map(select(.procs.box_id)) | length)" ),
         "Captchas        \(map(select(.t == "captcha" and .state == "pending")) | length)\(map(select(.t == "captcha" and .state == "cleared") | .waited) | if length > 0 then " (paused \(add / 60 | floor)m \(add % 60)s in total)" else "" end)",
         "Scrolls used    \(map(select(.t == "scroll")) | if length == 0 then "none" else (group_by(.scroll_id) | map("\(.[0].scroll_id) x\(length)") | join(", ")) end)",
         "Last hits       \($kills | map(select(.mine)) | length) of \($kills | length) boss kill(s) seen",
@@ -276,6 +285,10 @@ attack_gap_wait() {
 do_attack() { # kind = normal | ultimate; returns 1 if the server refused it
   local kind=$1 res
   [[ $kind == normal ]] && attack_gap_wait
+  # Damage set for ultimates and for attacks that are guaranteed crits (banked
+  # crit charges); loot set for everything else. Natural crits can't be
+  # predicted, so they land in whatever is worn.
+  if [[ $kind == ultimate ]] || (( $(me_num next_crits 0) > 0 )); then wear_loadout dmg; else wear_loadout loot; fi
   if res=$(api POST /api/attack "$(attack_body "$kind")"); then
     LAST_ERROR=""
     captcha_cleared
@@ -293,7 +306,7 @@ on_attack() {
   local b; b=$(jq -c '.boss // empty | select(type == "object")' <<<"$res" 2>/dev/null)
   [[ -n $b ]] && BOSS=$b
   record "$(jq -c --arg k "$kind" '.attack as $a | {t: "attack", kind: $k, damage: ($a.damage // 0),
-    crit: ($a.crit // false), item_id: $a.item_id, procs: ($a.procs // {}), boss_seq: .boss.seq, boss_hp: .boss.hp}' <<<"$res")"
+    crit: ($a.crit // false), item_id: $a.item_id, procs: ($a.procs // {}), boss_seq: .boss.seq, boss_hp: .boss.hp, loadout: $lo}' --arg lo "${CUR_LOADOUT:-}" <<<"$res")"
   jq -r --arg k "$kind" '.attack as $a | "\($k | ascii_upcase): \($a.damage) dmg" +
       (if $a.crit then " CRIT" else "" end) +
       (if $a.item_id then "  +item \($a.item_id)" else "" end) +
@@ -381,6 +394,56 @@ do_buy_box() {
     return 1
   fi
 }
+
+# ---------------------------------------------------------------- loadouts
+
+# loadout_index NAME|L1..L3 [FALLBACK_SLOT]: the 0-based slot of a saved loadout,
+# matched by name (case-insensitive), then by "L<n>", then the fallback slot.
+loadout_index() {
+  jq -r --arg want "$1" --arg fb "${2:-}" '(.loadouts // []) as $l
+    | ([$l | to_entries[] | select(.value != null and ((.value.name // "") | ascii_upcase) == ($want | ascii_upcase)) | .key][0])
+      // (if ($want | test("^[Ll][1-3]$")) then ($want[1:] | tonumber) - 1 else null end)
+      // (if $fb != "" and ($l[($fb | tonumber)] // null) != null then ($fb | tonumber) else null end)
+      // empty' <<<"$ME" 2>/dev/null
+}
+
+# worn_loadout: the slot of the saved loadout that matches what's worn, if any.
+worn_loadout() {
+  jq -r '.worn as $w | [(.loadouts // []) | to_entries[] | select(.value != null and (.value.worn // {}) as $lw
+    | ([$lw | to_entries[] | ($w[.key] // null) == (.value // null)] | all)) | .key][0] // empty' <<<"$ME" 2>/dev/null
+}
+
+loadout_name() { jq -r --argjson i "$1" '.loadouts[$i].name // "L\($i + 1)"' <<<"$ME" 2>/dev/null; }
+
+SWAP_WARNED=""
+CUR_LOADOUT="" # name of the loadout worn when the last attack was sent (for the log)
+
+# wear_loadout WHICH (dmg|loot): make sure that loadout is worn. Failures don't
+# block attacking: swapping backs off for 5 minutes and the attack goes ahead
+# in whatever is worn.
+wear_loadout() {
+  [[ $SWAP == 1 ]] && action_ok loadout || { CUR_LOADOUT=$(cur_loadout_name); return 0; }
+  local want idx now res
+  if [[ $1 == dmg ]]; then want=$DMG_LOADOUT; idx=$(loadout_index "$DMG_LOADOUT" 0)
+  else want=$LOOT_LOADOUT; idx=$(loadout_index "$LOOT_LOADOUT" 1); fi
+  if [[ -z $idx ]]; then
+    [[ $SWAP_WARNED == "$want" ]] || log "loadout \"$want\" not found among your saved loadouts; not swapping to it"
+    SWAP_WARNED=$want; CUR_LOADOUT=$(cur_loadout_name); return 0
+  fi
+  now=$(worn_loadout)
+  if [[ $now != "$idx" ]]; then
+    if res=$(api POST /api/me/loadout "$(jq -nc --argjson i "$idx" '{action: "wear", index: $i}')"); then
+      take_me "$res"
+      log "  wearing $(loadout_name "$idx")"
+    else
+      handle_error "wear loadout $want" "$res" optional
+      block_action loadout 300 "wearing $want"
+    fi
+  fi
+  CUR_LOADOUT=$(cur_loadout_name)
+}
+
+cur_loadout_name() { local i; i=$(worn_loadout); [[ -n $i ]] && loadout_name "$i" || echo "custom"; }
 
 # ---------------------------------------------------------------- captcha
 

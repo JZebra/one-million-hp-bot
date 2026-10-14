@@ -15,6 +15,17 @@ Every API response includes your updated player state (`me`), and the bot picks 
 
 Attacks recharge one every 5s, up to 20 stored.
 
+### Loadout swapping
+
+The game has 3 saved loadouts (`POST /api/me/loadout {action: "wear", index}`). The bot uses two of them:
+
+- **Damage loadout** (`OMHP_DMG_LOADOUT`, default `DMG`, the L1 slot): worn for every ultimate, and for normal attacks while crit charges are banked (those are guaranteed crits).
+- **Loot loadout** (`OMHP_LOOT_LOADOUT`, default `LOOTMAXXING`, the L2 slot): worn for every other normal attack.
+
+Loadouts are found by name first, then by slot (`L1`–`L3`). A swap only happens when the other set isn't already worn, so it's 2 extra requests per ultimate: on to the damage set, then back on the next normal attack. Natural crits can't be predicted (the server rolls them after the attack is sent), so they land in whatever is worn, usually the loot set. If a swap is refused, swapping pauses for 5 minutes and attacks continue in the current gear. `OMHP_SWAP=0` turns swapping off.
+
+Each attack records which loadout was worn, and the session summary breaks damage, items and boxes down per loadout. That's also how to check whether gear changes ultimate damage at all (unverified so far): compare the ultimate averages for the two loadouts.
+
 ### Captchas
 
 The game's bot scan can push an "ARE YOU HUMAN?" check to a player (`me.captcha`). Until it's answered, the server refuses attacks and scrolls, and 10 wrong answers in total ban the account. **The bot never answers captchas.** When one is pending it:
@@ -134,6 +145,9 @@ Loot boxes      10 opened  (1 bought for 100 shards)
 | `OMHP_DEAD_POLL`  | `30`                        | Seconds between checks while no boss is alive |
 | `OMHP_BUY_BOX`    | `max`                       | `max` = the shop's most expensive box; or a box ID; empty disables buying |
 | `OMHP_SCROLLS`    | `0`                         | `1` = use scrolls as soon as you have them |
+| `OMHP_SWAP`       | `1`                         | Swap loadouts: damage set for ultimates and charged crits, loot set for normal attacks |
+| `OMHP_DMG_LOADOUT` | `DMG`                      | Damage loadout: its name, or `L1`/`L2`/`L3` |
+| `OMHP_LOOT_LOADOUT` | `LOOTMAXXING`             | Loot loadout: its name, or `L1`/`L2`/`L3` |
 | `OMHP_CAPTCHA_POLL` | `30`                      | Seconds between checks while a captcha waits for you |
 | `OMHP_NOTIFY`     | `1`                         | macOS notification when a captcha appears; `0` turns it off |
 | `OMHP_ULT_HOLD`   | `1`                         | Hold attacks while the ultimate recharges, spend them right after it; `0` attacks as they recharge |
